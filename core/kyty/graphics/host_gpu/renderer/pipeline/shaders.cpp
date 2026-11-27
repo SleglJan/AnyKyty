@@ -235,6 +235,25 @@ static void CreateLayouts(GraphicContext& graphics, PipelineCache::Pipeline& pip
 		     sampled_images, max_stage_sampled, limits.maxDescriptorSetSampledImages,
 		     limits.maxPerStageDescriptorSampledImages);
 	}
+	if (pipeline.uses_image_heap) {
+		vk::PhysicalDeviceVulkan12Properties heap_limits {};
+		vk::PhysicalDeviceProperties2        properties {};
+		properties.pNext = &heap_limits;
+		graphics.physical_device.getProperties2(&properties);
+		const uint64_t heap                = ShaderRecompiler::IR::ImageHeapCapacity;
+		const auto     max_stage_resources = *std::ranges::max_element(stage_resources);
+		if (sampled_images + heap > heap_limits.maxDescriptorSetUpdateAfterBindSampledImages ||
+		    max_stage_sampled + heap > heap_limits.maxPerStageDescriptorUpdateAfterBindSampledImages ||
+		    max_stage_resources + heap > heap_limits.maxPerStageUpdateAfterBindResources) {
+			EXIT("pipeline needs %" PRIu64 " sampled images (%" PRIu64 " in one stage) and %" PRIu64
+			     " resources in one stage next to the image heap's %" PRIu64 "; with update after bind the device "
+			     "allows %u sampled images per pipeline layout, %u per stage and %u resources per stage\n",
+			     sampled_images, max_stage_sampled, max_stage_resources, heap,
+			     heap_limits.maxDescriptorSetUpdateAfterBindSampledImages,
+			     heap_limits.maxPerStageDescriptorUpdateAfterBindSampledImages,
+			     heap_limits.maxPerStageUpdateAfterBindResources);
+		}
+	}
 	pipeline.uses_push_descriptors =
 	    !pipeline.native_bindings && descriptor_count <= graphics.max_push_descriptors;
 
