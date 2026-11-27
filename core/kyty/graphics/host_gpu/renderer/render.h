@@ -609,7 +609,7 @@ private:
 	std::shared_ptr<RayTracingCheck>     m_rt_check;
 	std::shared_ptr<WaveSplitCheck>      m_split_check;
 	std::shared_ptr<WaveSplitCheck>      m_generic_check;
-	std::vector<ImageId>                  m_bound_images;
+	std::vector<TableImageRef>            m_bound_images;
 	std::vector<vk::DescriptorImageInfo>  m_descriptor_images;
 	std::vector<vk::WriteDescriptorSet>   m_descriptor_writes;
 	std::vector<vk::CopyDescriptorSet>    m_descriptor_copies;

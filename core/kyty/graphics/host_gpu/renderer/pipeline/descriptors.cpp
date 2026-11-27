@@ -2060,7 +2060,8 @@ void RenderExecutor::RebindReusedTables(PreparedBindings& prepared) {
 		       (!image->is_depth_copy || texture_cache.DepthCopyCurrent(*image)) && TableImageReady(*image, texture);
 	};
 	const auto bound_stamp = ++m_bound_image_stamp;
-	for (const auto id: m_bound_images) {
+	for (const auto ref: m_bound_images) {
+		const auto id = ref.id;
 		if (!id) {
 			continue;
 		}
@@ -2229,7 +2230,7 @@ void RenderExecutor::BindImage(ImageId id, bool storage) {
 	}
 	image.binding.is_bound = true;
 	image.binding.shader_write |= storage;
-	m_bound_images.push_back(id);
+	m_bound_images.push_back({id, image.serial});
 }
 
 void RenderExecutor::BindRenderTarget(ImageId id) {
@@ -2239,7 +2240,7 @@ void RenderExecutor::BindRenderTarget(ImageId id) {
 	const auto frame                 = m_context.FlipNumber();
 	image.target_frames[frame & 3u] = frame + 1u;
 #endif
-	m_bound_images.push_back(id);
+	m_bound_images.push_back({id, image.serial});
 }
 
 void RenderExecutor::ResetBindings() {
@@ -2260,12 +2261,13 @@ void RenderExecutor::ResetBindings() {
 		LogTableSummary(TrimTableBindings());
 	}
 	auto& texture_cache = m_context.GetTextureCache();
-	for (const auto id: m_bound_images) {
-		auto& image = texture_cache.m_slot_images[id];
-		if (image.is_stencil_copy && image.binding.shader_write) {
-			texture_cache.FinishStencilStorageWrite(id);
+	for (const auto ref: m_bound_images) {
+		auto* image = ref.Get(texture_cache.m_slot_images);
+		if (image == nullptr) continue;
+		if (image->is_stencil_copy && image->binding.shader_write) {
+			texture_cache.FinishStencilStorageWrite(ref.id);
 		}
-		image.binding = {};
+		image->binding = {};
 	}
 	m_bound_images.clear();
 	if (m_clear_texture_descs) {

@@ -1,3 +1,4 @@
+#include "RenderExecutorTestAccess.h"
 #include "TestVulkanDevice.h"
 #include "common/emulatorConfig.h"
 #include "common/threads.h"
@@ -112,7 +113,8 @@ void CheckRebind(GraphicContext& graphics, uint64_t base, bool table) {
 	        std::string(path) + ": the mipmapped texture at the same address did not replace the texture's image");
 	scheduler.Wait(scheduler.CurrentTick());
 	scheduler.PopPendingOperations();
-	executor.PrepareBindings(unrelated_stage, third);
+	auto other = std::make_unique<RenderExecutor>(renderer);
+	other->PrepareBindings(unrelated_stage, third);
 	Require(third.images.at(0).image_id == handed,
 	        std::string(path) + ": the unrelated texture did not take the freed image slot");
 	const auto unrelated_binding = textures.GetImage(handed).binding;
@@ -139,6 +141,12 @@ void CheckRebind(GraphicContext& graphics, uint64_t base, bool table) {
 	            kept.binding.force_general == unrelated_binding.force_general &&
 	            kept.binding.shader_write == unrelated_binding.shader_write && kept.table_pins == unrelated_pins,
 	        std::string(path) + ": RebindImages changed the binding state of the unrelated image in the slot");
+
+	RenderExecutorTestAccess::Reset(executor);
+	Require(!image.binding.is_bound && kept.binding.is_bound,
+	        std::string(path) + ": resetting bindings did not respect the image owners");
+	RenderExecutorTestAccess::Reset(*other);
+	Require(!kept.binding.is_bound, std::string(path) + ": the replacement binding was not reset");
 }
 
 }
