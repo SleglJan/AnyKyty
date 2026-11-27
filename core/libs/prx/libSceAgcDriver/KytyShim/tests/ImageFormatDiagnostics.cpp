@@ -28,7 +28,7 @@ IR::DescriptorValue MakeStorageDescriptor(Prospero::BufferFormat format) {
     return value;
 }
 
-IR::ResourcePlan MakeAtomicImagePlan(Prospero::BufferFormat format) {
+IR::ResourcePlan MakeStorageImagePlan(Prospero::BufferFormat format, bool atomic) {
     IR::ResourcePlan plan;
     plan.stage                      = ShaderType::Compute;
     plan.resource_tracking_complete = true;
@@ -45,7 +45,7 @@ IR::ResourcePlan MakeAtomicImagePlan(Prospero::BufferFormat format) {
     IR::ImageResource image;
     image.resource_class = IR::ImageResourceClass::Storage;
     image.written        = true;
-    image.atomic         = true;
+    image.atomic         = atomic;
     image.dimension      = Decoder::ImageDimension::Dim2D;
     image.source         = 0u;
     image.first_use_pc   = 0x1234u;
@@ -62,7 +62,7 @@ std::string ReadFile(const std::filesystem::path& path) {
 }
 
 int main() {
-    const auto valid_plan = MakeAtomicImagePlan(Prospero::BufferFormat::k32UInt);
+    const auto valid_plan = MakeStorageImagePlan(Prospero::BufferFormat::k32UInt, true);
     IR::SrtRuntime             runtime {};
     IR::ResourceSnapshot       valid_snap;
     IR::ResourceSpecialization valid_spec;
@@ -76,22 +76,27 @@ int main() {
     FILE* redirected = std::freopen(log_path.string().c_str(), "w", stderr);
     Require(redirected != nullptr, "failed to redirect stderr");
 
-    const auto                 invalid_plan = MakeAtomicImagePlan(Prospero::BufferFormat::k8UInt);
-    IR::ResourceSnapshot       invalid_snap;
-    IR::ResourceSpecialization invalid_spec;
-    const bool ok = IR::MaterializeResources(invalid_plan, runtime, invalid_snap, invalid_spec);
-    std::fflush(stderr);
-    std::freopen("NUL", "w", stderr);
+    const auto atomic_plan = MakeStorageImagePlan(Prospero::BufferFormat::k8SInt, true);
+    const auto storage_plan = MakeStorageImagePlan(Prospero::BufferFormat::k8SInt, false);
+    for (const auto* plan : {&atomic_plan, &storage_plan, &atomic_plan, &storage_plan}) {
+        IR::ResourceSnapshot       snapshot;
+        IR::ResourceSpecialization spec;
+        Require(!IR::MaterializeResources(*plan, runtime, snapshot, spec),
+                "unsupported image format unexpectedly materialized");
+    }
+    Require(std::fclose(redirected) == 0, "failed to flush diagnostic log");
     const std::string log = ReadFile(log_path);
-    std::error_code   ec;
-    std::filesystem::remove(log_path, ec);
+    std::filesystem::remove(log_path);
 
-    Require(!ok, "8-bit atomic image unexpectedly materialized");
-    if (log.find("atomic image descriptor 0 uses unsupported format 5: root=0 source=0 "
-                 "first_use_pc=0x1234 r128=false words=00001000,c0500000,0000000f,90000fac,"
-                 "00000000,00000000,00000000,00000000") == std::string::npos) {
-        std::fprintf(stdout, "unexpected log: %s\n", log.c_str());
-        return 1;
+    for (const auto* kind : {"atomic", "storage"}) {
+        const auto message = std::string(kind) +
+            " image descriptor 0 uses unsupported format 6: root=0 source=0 "
+            "first_use_pc=0x1234 r128=false words=00001000,c0600000,0000000f,90000fac,"
+            "00000000,00000000,00000000,00000000";
+        const auto first = log.find(message);
+        Require(first != std::string::npos, "missing descriptor context");
+        Require(log.find(message, first + message.size()) == std::string::npos,
+                "repeated descriptor diagnostic");
     }
 
     std::puts("kyty_shim_image_format_diagnostics: ok");
