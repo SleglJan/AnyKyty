@@ -318,8 +318,9 @@ std::array<IR::Value, 6> UserRay(SourceWalk& walk) {
     return ray;
 }
 
-void BuildWalk(SourceWalk& walk, const Loop& loop, std::array<IR::Value, 2> header, const std::array<IR::Value, 6>& ray, HighWord kind, bool scalar_blas = false,
-               bool offset_first = false) {
+std::array<IR::Value, 2> BuildWalk(SourceWalk& walk, const Loop& loop, std::array<IR::Value, 2> header,
+                                   const std::array<IR::Value, 6>& ray, HighWord kind, bool scalar_blas = false, bool offset_first = false,
+                                   std::optional<std::array<IR::Value, 2>> descriptor_header = std::nullopt) {
     using Op               = IR::ValueOpcode;
     const auto u32         = [](uint32_t value) { return IR::Value(value); };
     const auto word        = static_cast<uint64_t>(IR::Type::U32);
@@ -360,9 +361,13 @@ void BuildWalk(SourceWalk& walk, const Loop& loop, std::array<IR::Value, 2> head
     const auto table = walk.Add(Op::GetAddressResource, {header_low, header_high});
     const auto offset_low  = walk.LoadAddress(table, 0x30);
     const auto offset_high = walk.LoadAddress(table, 0x34);
-    const auto low   = offset_first ? walk.Add(Op::IAdd32, {offset_low, header_low}) : walk.Add(Op::IAdd32, {header_low, offset_low});
-    const auto carry = walk.Add(Op::SelectU32, {walk.Add(Op::ULessThan32, {low, offset_first ? offset_low : header_low}), u32(1), u32(0)});
-    auto       high  = walk.Add(Op::IAdd32, {offset_first ? walk.Add(Op::IAdd32, {offset_high, header_high}) : walk.Add(Op::IAdd32, {header_high, offset_high}), carry});
+    const auto [base_lo, base_hi] = descriptor_header.value_or(header);
+    const auto left  = offset_first ? offset_low : base_lo;
+    const auto right = offset_first ? base_lo : offset_low;
+    const auto low   = walk.Add(Op::IAdd32, {left, right});
+    const auto carry = walk.Add(Op::SelectU32, {walk.Add(Op::ULessThan32, {low, left}), u32(1), u32(0)});
+    const auto upper = offset_first ? walk.Add(Op::IAdd32, {offset_high, base_hi}) : walk.Add(Op::IAdd32, {base_hi, offset_high});
+    auto       high  = walk.Add(Op::IAdd32, {upper, carry});
     if (kind == HighWord::StrideBit) high = walk.Add(Op::IAdd32, {high, u32(0x00010000u)});
     if (kind == HighWord::SwizzleBit) high = walk.Add(Op::BitwiseOr32, {high, u32(0x40000000u)});
     if (kind == HighWord::Masked) high = walk.Add(Op::BitwiseAnd32, {high, u32(0xffffu)});
@@ -408,6 +413,7 @@ void BuildWalk(SourceWalk& walk, const Loop& loop, std::array<IR::Value, 2> head
         rays[k]->AddPhiOperand(&loop.latch, pick(local[k], current[k]));
     }
     loop.merge.AppendNewInst(Op::Phi, {}, word).AddPhiOperand(&loop.body, child);
+    return {IR::Value(&base_low), IR::Value(&base_high)};
 }
 
 IR::OracleWalks DeriveWithHighWord(HighWord kind, IR::ResourceKind address_kind = {}, uint32_t header_at = 0x20,
@@ -627,7 +633,7 @@ IR::OracleWalks GuardedWalks(WalkGuard guard, bool carried = false) {
     walk.entry.terminator.merge_block = &join;
     walk.entry.AddBranch(&join);
     walk.entry.AddBranch(&pre);
-    BuildWalk(walk, {pre, walk.header, walk.body, walk.latch, walk.merge}, first, ray, HighWord::Exact);
+    const auto carried_base = BuildWalk(walk, {pre, walk.header, walk.body, walk.latch, walk.merge}, first, ray, HighWord::Exact);
 
     walk.block        = &walk.merge;
     const auto table  = walk.Add(Op::GetAddressResource, {second[0], second[1]});
@@ -639,12 +645,7 @@ IR::OracleWalks GuardedWalks(WalkGuard guard, bool carried = false) {
     const auto record = [&](uint32_t dword) {
         return walk.Load(Op::LoadBufferU32, {buffer, index, u32(0), u32(0), IR::Value(true)}, dword * 4u, true);
     };
-    std::array<IR::Value, 2> raw {record(12), record(13)};
-    if (carried) {
-        auto phi = walk.header.Instructions().begin();
-        raw[0]   = IR::Value(&*phi);
-        raw[1]   = IR::Value(&*++phi);
-    }
+    const auto raw = carried ? carried_base : std::array {record(12), record(13)};
     Link(walk.merge, join);
 
     walk.block       = &join;
@@ -695,6 +696,56 @@ void UnreachableEdgeWalks() {
     const auto live = GuardedWalks(WalkGuard::Reachable, true);
     Expect(live.refusal != nullptr && std::strcmp(live.refusal, "a buffer descriptor's high word is not proven to leave the stride bits clear") == 0,
            "a descriptor base offset from a carried value that can reach the walk is still refused");
+}
+
+enum class DescriptorPhi { Same, Displaced, WrongCarry, GatedCarry };
+
+void AlternateDescriptorBase(DescriptorPhi kind) {
+    using Op = IR::ValueOpcode;
+    IR::Block displaced, join;
+    SourceWalk walk;
+    walk.program.blocks = {&walk.entry, &displaced, &join, &walk.header, &walk.body, &walk.latch, &walk.merge};
+    Number(walk);
+    const auto ray    = UserRay(walk);
+    const auto header = UserHeader(walk, 0x20);
+    const auto flag   = walk.Add(Op::GetUserData, {IR::Value(IR::ScalarReg {14})});
+    walk.entry.condition              = walk.Add(Op::INotEqual32, {flag, IR::Value(0u)});
+    walk.entry.terminator.kind        = CFG::TerminatorKind::ConditionalBranch;
+    walk.entry.terminator.true_block  = &displaced;
+    walk.entry.terminator.false_block = &join;
+    walk.entry.terminator.merge_block = &join;
+    walk.entry.AddBranch(&displaced);
+    walk.entry.AddBranch(&join);
+
+    walk.block = &displaced;
+    const auto incoming = kind == DescriptorPhi::Displaced ? walk.Offset(header[0], header[1], IR::Value(0x10000u)) : header;
+    Link(displaced, join);
+    const auto word = static_cast<uint64_t>(IR::Type::U32);
+    auto& low  = join.AppendNewInst(Op::Phi, {}, word);
+    auto& high = join.AppendNewInst(Op::Phi, {}, word);
+    low.AddPhiOperand(&walk.entry, header[0]);
+    low.AddPhiOperand(&displaced, incoming[0]);
+    high.AddPhiOperand(&displaced, incoming[1]);
+    high.AddPhiOperand(&walk.entry, header[1]);
+    BuildWalk(walk, {join, walk.header, walk.body, walk.latch, walk.merge}, header, ray, HighWord::Exact, false, true,
+              std::array {IR::Value(&low), IR::Value(&high)});
+    for (auto it = walk.latch.begin(); it != walk.latch.end(); ++it) {
+        if (kind == DescriptorPhi::WrongCarry && it->GetOpcode() == Op::ULessThan32) it->SetArg(1, flag);
+        if (kind == DescriptorPhi::GatedCarry && it->GetOpcode() == Op::SelectU32 && it->Arg(1) == IR::Value(1u)) {
+            const auto gate = walk.latch.PrependNewInst(it, Op::LogicalAnd, {walk.entry.condition, it->Arg(0)});
+            it->SetArg(0, IR::Value(&*gate));
+        }
+    }
+    const auto derived = IR::DeriveOracleWalks(walk.program, walk.sites);
+    if (kind == DescriptorPhi::Same) {
+        Expect(derived.refusal == nullptr, "equal header inputs on both live edges prove the descriptor base");
+    } else if (kind == DescriptorPhi::Displaced) {
+        Expect(derived.refusal != nullptr, "a bounded phi input cannot prove a descriptor whose other live input has a different base");
+    } else if (kind == DescriptorPhi::WrongCarry) {
+        Expect(derived.refusal != nullptr, "a comparison against an unrelated register cannot supply the descriptor carry");
+    } else {
+        Expect(derived.refusal != nullptr, "a carry gated by an unknown predicate cannot prove the descriptor base");
+    }
 }
 
 void HeaderPrograms() {
@@ -890,6 +941,10 @@ int main() {
     ComputedHeader(ChasedSource::Scalar);
     ComputedHeader(ChasedSource::ScalarBuffer);
     UnreachableEdgeWalks();
+    AlternateDescriptorBase(DescriptorPhi::Same);
+    AlternateDescriptorBase(DescriptorPhi::Displaced);
+    AlternateDescriptorBase(DescriptorPhi::WrongCarry);
+    AlternateDescriptorBase(DescriptorPhi::GatedCarry);
     HeaderPrograms();
     CodeWaveSize();
     DescriptorHighWord();

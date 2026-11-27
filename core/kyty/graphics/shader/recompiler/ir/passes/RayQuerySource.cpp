@@ -620,7 +620,7 @@ public:
 			}
 		}
 		Choices result;
-		for (const auto& lift: Lift(lo, 0, leaves)) {
+		for (const auto& lift: Lift(lo, 0, leaves, rest.size() == 1)) {
 			if (lift.adds.size() != carries.size() ||
 			    !std::ranges::all_of(carries, [&](const Inst* carry) { return std::ranges::find(lift.adds, carry) != lift.adds.end(); })) {
 				continue;
@@ -1162,28 +1162,41 @@ private:
 		const auto* select = ProducerOf(value, ValueOpcode::SelectU32);
 		if (select == nullptr || ImmediateU32(select->Arg(1)) != 1u || ImmediateU32(select->Arg(2)) != 0u) return nullptr;
 		Value condition = select->Arg(0);
-		const auto compares = [](Value value) {
-			const auto* inst = value.Resolve().TryInstruction();
-			return inst != nullptr && (inst->GetOpcode() == ValueOpcode::ULessThan32 || inst->GetOpcode() == ValueOpcode::UGreaterThan32);
-		};
 		for (uint32_t depth = 0; depth < 4; ++depth) {
 			const auto* both = ProducerOf(condition, ValueOpcode::LogicalAnd);
 			if (both == nullptr) break;
-			const bool left  = Decide(both->Arg(0)) == true || (compares(both->Arg(1)) && !compares(both->Arg(0)));
-			const bool right = Decide(both->Arg(1)) == true || (compares(both->Arg(0)) && !compares(both->Arg(1)));
-			if (left == right) break;
-			condition = both->Arg(left ? 1 : 0);
+			if (Decide(both->Arg(0)) == true) condition = both->Arg(1);
+			else if (Decide(both->Arg(1)) == true) condition = both->Arg(0);
+			else return nullptr;
 		}
-		if (const auto* less = ProducerOf(condition, ValueOpcode::ULessThan32)) {
-			return less->Arg(0).Resolve().TryInstruction();
-		}
-		if (const auto* more = ProducerOf(condition, ValueOpcode::UGreaterThan32)) {
-			return more->Arg(1).Resolve().TryInstruction();
-		}
-		return nullptr;
+		const auto* compare = condition.Resolve().TryInstruction();
+		if (compare == nullptr) return nullptr;
+		const bool less = compare->GetOpcode() == ValueOpcode::ULessThan32;
+		if (!less && compare->GetOpcode() != ValueOpcode::UGreaterThan32) return nullptr;
+		const auto* sum = ProducerOf(compare->Arg(less ? 0 : 1), ValueOpcode::IAdd32);
+		const auto term = compare->Arg(less ? 1 : 0).Resolve();
+		return sum != nullptr && (sum->Arg(0).Resolve() == term || sum->Arg(1).Resolve() == term) ? sum : nullptr;
 	}
 
-	std::vector<LiftResult> Lift(Value lo, uint32_t depth, const std::vector<Value>& leaves) {
+	std::optional<uint32_t> JoinedPhi(const Inst& low, const Inst& high) {
+		const auto used_at_join = [](const Inst& phi) {
+			return std::ranges::any_of(phi.Uses(), [&](const Use& use) { return use.user->Parent() == phi.Parent(); });
+		};
+		const bool can_prune = !used_at_join(low) && !used_at_join(high);
+		std::optional<uint32_t> result;
+		for (size_t index = 0; index < low.NumArgs(); ++index) {
+			if (can_prune && Unreached(low, index)) continue;
+			const auto lower = Word(low.Arg(index));
+			const auto upper = Word(Incoming(high, low.PhiBlock(index)));
+			if (lower.size() != 1 || upper.size() != 1) return std::nullopt;
+			const auto wide = m_store.Join(lower.front(), upper.front());
+			if (result && *result != wide) return std::nullopt;
+			result = wide;
+		}
+		return result;
+	}
+
+	std::vector<LiftResult> Lift(Value lo, uint32_t depth, const std::vector<Value>& leaves, bool unique_high) {
 		lo = lo.Resolve();
 		std::vector<LiftResult> result;
 		const auto              zero = m_store.Constant(32, 0);
@@ -1192,7 +1205,7 @@ private:
 		if (inst == nullptr || depth > 12) return {};
 		switch (inst->GetOpcode()) {
 			case ValueOpcode::IAdd32: {
-				const auto left = Lift(inst->Arg(0), depth + 1, leaves), right = Lift(inst->Arg(1), depth + 1, leaves);
+				const auto left = Lift(inst->Arg(0), depth + 1, leaves, unique_high), right = Lift(inst->Arg(1), depth + 1, leaves, unique_high);
 				for (size_t diagonal = 0; diagonal + 1 < left.size() + right.size(); ++diagonal) {
 					for (size_t i = 0; i <= diagonal && i < left.size(); ++i) {
 						if (diagonal - i >= right.size()) continue;
@@ -1261,35 +1274,22 @@ private:
 				break;
 			case ValueOpcode::SelectU32: {
 				if (CarryOf(lo)) break;
-				if (const auto pick = Decide(inst->Arg(0))) return Lift(inst->Arg(*pick ? 1 : 2), depth + 1, leaves);
-				result = Lift(inst->Arg(1), depth + 1, leaves);
-				for (auto& other: Lift(inst->Arg(2), depth + 1, leaves)) result.push_back(std::move(other));
+				if (const auto pick = Decide(inst->Arg(0))) return Lift(inst->Arg(*pick ? 1 : 2), depth + 1, leaves, unique_high);
+				result = Lift(inst->Arg(1), depth + 1, leaves, unique_high);
+				for (auto& other: Lift(inst->Arg(2), depth + 1, leaves, unique_high)) result.push_back(std::move(other));
 				if (result.size() > MaxChoices) result.resize(MaxChoices);
 				return result;
 			}
 			case ValueOpcode::BitCastF32U32:
 			case ValueOpcode::BitCastU32F32:
-			case ValueOpcode::ReadFirstLane: return Lift(inst->Arg(0), depth + 1, leaves);
+			case ValueOpcode::ReadFirstLane: return Lift(inst->Arg(0), depth + 1, leaves, unique_high);
 			case ValueOpcode::Phi:
 				if (!m_order.Carried(*inst)) {
+					if (!unique_high) break;
 					for (const auto leaf: leaves) {
-						const auto* high = leaf.Resolve().TryInstruction();
-						if (high == nullptr || high == inst || high->GetOpcode() != ValueOpcode::Phi || high->Parent() != inst->Parent() ||
-						    m_order.Carried(*high) || !m_busy.insert(inst).second) {
-							continue;
-						}
-						const auto start = result.size();
-						for (size_t index = 0; index < inst->NumArgs(); ++index) {
-							if (Unreached(*inst, index)) continue;
-							const auto partner = Incoming(*high, inst->PhiBlock(index));
-							const auto pairs   = partner.IsEmpty() ? Choices {} : Pair(inst->Arg(index), partner, depth + 1);
-							if (pairs.empty()) {
-								result.resize(start);
-								break;
-							}
-							for (const auto wide: pairs) result.push_back({wide, m_store.Hi(wide), {}});
-						}
-						m_busy.erase(inst);
+						const auto* high = ProducerOf(leaf, ValueOpcode::Phi);
+						if (high == nullptr || high == inst || high->Parent() != inst->Parent() || m_order.Carried(*high)) continue;
+						if (const auto wide = JoinedPhi(*inst, *high)) result.push_back({*wide, m_store.Hi(*wide), {}});
 					}
 					break;
 				}
