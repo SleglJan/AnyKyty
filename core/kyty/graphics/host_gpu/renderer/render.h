@@ -53,7 +53,7 @@ struct TextureDescDerivation {
 	std::string unsupported;
 	bool        unknown_tiling = false;
 	struct Found {
-		ImageId                 id;
+		TableImageRef           image;
 		TextureCache::ImageDesc desc;
 		vk::ImageView           view            = nullptr;
 		uint64_t                image_set_epoch = 0;
