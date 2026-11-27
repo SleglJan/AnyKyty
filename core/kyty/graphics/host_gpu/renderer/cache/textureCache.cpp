@@ -4049,8 +4049,9 @@ uint64_t TextureCache::AdvanceGcTick() {
 
 void TextureCache::RunGarbageCollector() {
 	Common::ScopedLock lock {m_lock};
-	const uint64_t pass = m_gc_pass.fetch_add(1, std::memory_order_relaxed) + 1;
-	const uint64_t tick = AdvanceGcTick();
+	const uint64_t pass       = m_gc_pass.fetch_add(1, std::memory_order_relaxed) + 1;
+	const uint64_t frame_tick = m_gc_tick;
+	const uint64_t tick       = AdvanceGcTick();
 	{
 		Common::ScopedLock pending {m_pending_meta_lock};
 		for (auto it = m_pending_meta_clears.begin(); it != m_pending_meta_clears.end();) {
@@ -4101,6 +4102,9 @@ void TextureCache::RunGarbageCollector() {
 			}
 			auto owner = m_slot_images.try_get(id);
 			if (owner == nullptr || !owner->registered || owner->depth_id) {
+				continue;
+			}
+			if (owner->lru_tick >= frame_tick) {
 				continue;
 			}
 			if (owner->heap_refs.load(std::memory_order_relaxed) != 0u || owner->table_pins != 0) {

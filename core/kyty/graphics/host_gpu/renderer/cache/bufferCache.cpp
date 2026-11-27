@@ -3351,7 +3351,8 @@ uint64_t BufferCache::AdvanceGcTick() {
 
 void BufferCache::RunGarbageCollector() {
 	ServeInPlaceConversions();
-	const auto tick = AdvanceGcTick();
+	const uint64_t frame_tick = m_gc_tick;
+	const auto     tick       = AdvanceGcTick();
 	CollectStaleBuffers(tick);
 	if (m_graphics.CanReportMemoryUsage()) {
 		const auto budget = m_graphics.GetTotalMemoryBudget();
@@ -3372,6 +3373,9 @@ void BufferCache::RunGarbageCollector() {
 	size_t                retire_count = 0;
 	m_lru_cache.ForEachItemBelow(tick - age, [&](BufferId id) {
 		auto& buffer = m_slot_buffers[id];
+		if (m_lru_cache.TickOf(buffer.lru_id) >= frame_tick) {
+			return false;
+		}
 		if (buffer.device_address_pinned && m_lru_cache.TickOf(buffer.lru_id) + PinnedAge > tick) {
 			return false;
 		}

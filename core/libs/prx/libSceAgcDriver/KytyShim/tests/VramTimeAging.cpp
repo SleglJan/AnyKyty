@@ -58,11 +58,12 @@ namespace {
 using namespace Libs::Graphics;
 
 constexpr uint64_t Page         = TRACKER_PAGE_SIZE;
-constexpr uint64_t GuestBytes   = 0x40000;
+constexpr uint64_t GuestBytes   = 0x50000;
 constexpr int      CpuReadWrite = 0x03;
 
 const char* CheckTextureWallTimeAging(TextureCache& textures, uint64_t address) {
-	ImageId id {};
+	ImageId stale_id {};
+	ImageId active_id {};
 	if (address != 0) {
 		ImageInfo info;
 		info.data.address = address;
@@ -72,9 +73,17 @@ const char* CheckTextureWallTimeAging(TextureCache& textures, uint64_t address) 
 		info.pitch        = 64;
 		info.UpdateSize();
 
-		id = VramTimeAgingTestAccess::CreateImage(textures, info);
-		if (!VramTimeAgingTestAccess::IsImageRegistered(textures, id)) {
+		stale_id = VramTimeAgingTestAccess::CreateImage(textures, info);
+		if (!VramTimeAgingTestAccess::IsImageRegistered(textures, stale_id)) {
 			return "test image was not registered";
+		}
+		VramTimeAgingTestAccess::RewindTextureClock(textures, std::chrono::milliseconds(16));
+		textures.RunGarbageCollector();
+
+		info.data.address = address + 0x8000;
+		active_id         = VramTimeAgingTestAccess::CreateImage(textures, info);
+		if (!VramTimeAgingTestAccess::IsImageRegistered(textures, active_id)) {
+			return "active test image was not registered";
 		}
 	}
 	VramTimeAgingTestAccess::RewindTextureClock(textures, std::chrono::milliseconds(500));
@@ -82,18 +91,28 @@ const char* CheckTextureWallTimeAging(TextureCache& textures, uint64_t address) 
 	if (VramTimeAgingTestAccess::TextureTick(textures) < 30) {
 		return "texture cache GC tick did not advance with elapsed wall time";
 	}
-	if (address != 0 && VramTimeAgingTestAccess::IsImageRegistered(textures, id)) {
+	if (address != 0 && VramTimeAgingTestAccess::IsImageRegistered(textures, stale_id)) {
 		return "texture cache did not evict an unused image after 500 ms wall time";
+	}
+	if (address != 0 && !VramTimeAgingTestAccess::IsImageRegistered(textures, active_id)) {
+		return "texture cache evicted an image touched in the current frame across a 500 ms jump";
 	}
 	return nullptr;
 }
 
 const char* CheckBufferWallTimeAging(BufferCache& buffers, uint64_t address) {
-	const auto buf_addr = address != 0 ? address + 0x10000 : 0;
+	const auto buf_addr        = address != 0 ? address + 0x10000 : 0;
+	const auto active_buf_addr = address != 0 ? address + 0x30000 : 0;
 	if (buf_addr != 0) {
 		(void)buffers.FindBuffer(buf_addr, Page);
 		if (!buffers.RegisteredBuffer(buf_addr, Page)) {
 			return "test buffer was not registered";
+		}
+		VramTimeAgingTestAccess::RewindBufferClock(buffers, std::chrono::milliseconds(16), false);
+		buffers.RunGarbageCollector();
+		(void)buffers.FindBuffer(active_buf_addr, Page);
+		if (!buffers.RegisteredBuffer(active_buf_addr, Page)) {
+			return "active test buffer was not registered";
 		}
 	}
 	VramTimeAgingTestAccess::RewindBufferClock(buffers, std::chrono::milliseconds(3000), true);
@@ -104,6 +123,9 @@ const char* CheckBufferWallTimeAging(BufferCache& buffers, uint64_t address) {
 	if (buf_addr != 0 && buffers.RegisteredBuffer(buf_addr, Page)) {
 		return "buffer cache did not evict an unused buffer after 3000 ms wall time";
 	}
+	if (active_buf_addr != 0 && !buffers.RegisteredBuffer(active_buf_addr, Page)) {
+		return "buffer cache evicted a buffer touched in the current frame across a 3000 ms jump";
+	}
 
 	const auto stale_addr = address != 0 ? address + 0x20000 : 0;
 	if (stale_addr != 0) {
@@ -111,6 +133,8 @@ const char* CheckBufferWallTimeAging(BufferCache& buffers, uint64_t address) {
 		if (!buffers.RegisteredBuffer(stale_addr, Page)) {
 			return "stale test buffer was not registered";
 		}
+		VramTimeAgingTestAccess::RewindBufferClock(buffers, std::chrono::milliseconds(16), false);
+		buffers.RunGarbageCollector();
 	}
 	const auto before_stale_tick = VramTimeAgingTestAccess::BufferTick(buffers);
 	VramTimeAgingTestAccess::RewindBufferClock(buffers, std::chrono::milliseconds(35005), false);
