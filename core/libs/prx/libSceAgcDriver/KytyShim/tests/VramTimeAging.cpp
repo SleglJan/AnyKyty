@@ -127,7 +127,8 @@ const char* CheckBufferWallTimeAging(BufferCache& buffers, uint64_t address) {
 		return "buffer cache evicted a buffer touched in the current frame across a 3000 ms jump";
 	}
 
-	const auto stale_addr = address != 0 ? address + 0x20000 : 0;
+	const auto stale_addr        = address != 0 ? address + 0x20000 : 0;
+	const auto active_stale_addr = address != 0 ? address + 0x40000 : 0;
 	if (stale_addr != 0) {
 		(void)buffers.FindBuffer(stale_addr, Page);
 		if (!buffers.RegisteredBuffer(stale_addr, Page)) {
@@ -135,6 +136,10 @@ const char* CheckBufferWallTimeAging(BufferCache& buffers, uint64_t address) {
 		}
 		VramTimeAgingTestAccess::RewindBufferClock(buffers, std::chrono::milliseconds(16), false);
 		buffers.RunGarbageCollector();
+		(void)buffers.FindBuffer(active_stale_addr, Page);
+		if (!buffers.RegisteredBuffer(active_stale_addr, Page)) {
+			return "active stale test buffer was not registered";
+		}
 	}
 	const auto before_stale_tick = VramTimeAgingTestAccess::BufferTick(buffers);
 	VramTimeAgingTestAccess::RewindBufferClock(buffers, std::chrono::milliseconds(35005), false);
@@ -144,6 +149,9 @@ const char* CheckBufferWallTimeAging(BufferCache& buffers, uint64_t address) {
 	}
 	if (stale_addr != 0 && buffers.RegisteredBuffer(stale_addr, Page)) {
 		return "buffer cache stale collection skipped an unaligned wall-time tick jump";
+	}
+	if (active_stale_addr != 0 && !buffers.RegisteredBuffer(active_stale_addr, Page)) {
+		return "buffer cache stale collection retired a buffer touched in the current frame";
 	}
 	return nullptr;
 }

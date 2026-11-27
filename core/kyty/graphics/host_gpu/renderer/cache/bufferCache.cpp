@@ -3173,7 +3173,7 @@ bool BufferCache::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {
 	return m_memory_tracker.IsRegionCpuModified(vaddr, size);
 }
 
-void BufferCache::CollectStaleBuffers(uint64_t tick) {
+void BufferCache::CollectStaleBuffers(uint64_t tick, uint64_t frame_tick) {
 	static constexpr uint64_t StalePeriod   = 8;
 	static constexpr size_t   StaleVisitMax = 64;
 	static constexpr size_t   StaleFreeMax  = 16;
@@ -3185,6 +3185,9 @@ void BufferCache::CollectStaleBuffers(uint64_t tick) {
 	std::vector<BufferId> kept;
 	m_lru_cache.ForEachItemBelow(tick - StaleAge, [&](BufferId id) {
 		const auto& buffer = m_slot_buffers[id];
+		if (m_lru_cache.TickOf(buffer.lru_id) >= frame_tick) {
+			return false;
+		}
 		const bool  keep   = buffer.device_address_pinned ||
 		                  m_gpu_modified_ranges.Intersects(buffer.CpuAddress(), buffer.Size()) ||
 		                  m_memory_tracker.IsRegionGpuModified(buffer.CpuAddress(), buffer.Size());
@@ -3353,7 +3356,7 @@ void BufferCache::RunGarbageCollector() {
 	ServeInPlaceConversions();
 	const uint64_t frame_tick = m_gc_tick;
 	const auto     tick       = AdvanceGcTick();
-	CollectStaleBuffers(tick);
+	CollectStaleBuffers(tick, frame_tick);
 	if (m_graphics.CanReportMemoryUsage()) {
 		const auto budget = m_graphics.GetTotalMemoryBudget();
 		if (budget != m_memory_budget) {

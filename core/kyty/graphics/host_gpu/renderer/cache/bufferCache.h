@@ -330,7 +330,7 @@ private:
 	void ChangeRegister(BufferId id);
 	void DeleteBuffer(BufferId id);
 	void DiscardGpuWrites(uint64_t vaddr, uint64_t size);
-	void CollectStaleBuffers(uint64_t tick);
+	void CollectStaleBuffers(uint64_t tick, uint64_t frame_tick);
 	[[nodiscard]] bool NoImageStartsAt(uint64_t vaddr) const noexcept;
 	[[nodiscard]] bool SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t size,
 	                                     bool is_written, bool is_texel_buffer);
