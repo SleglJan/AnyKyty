@@ -8,14 +8,52 @@
 #include <iterator>
 #include <string>
 
+#if defined(_WIN32)
+#include <io.h>
+#else
+#include <unistd.h>
+#endif
+
 namespace {
 
 using namespace Libs::Graphics;
 using namespace Libs::Graphics::ShaderRecompiler;
 
+int DupFd(int fd) {
+#if defined(_WIN32)
+    return _dup(fd);
+#else
+    return dup(fd);
+#endif
+}
+
+int Dup2Fd(int src, int dst) {
+#if defined(_WIN32)
+    return _dup2(src, dst);
+#else
+    return dup2(src, dst);
+#endif
+}
+
+int CloseFd(int fd) {
+#if defined(_WIN32)
+    return _close(fd);
+#else
+    return close(fd);
+#endif
+}
+
+int FilenoStream(FILE* stream) {
+#if defined(_WIN32)
+    return _fileno(stream);
+#else
+    return fileno(stream);
+#endif
+}
+
 void Require(bool condition, const char* message) {
     if (condition) return;
-    std::fprintf(stdout, "kyty_shim_image_format_diagnostics: %s\n", message);
+    std::fprintf(stderr, "kyty_shim_image_format_diagnostics: %s\n", message);
     std::exit(1);
 }
 
@@ -62,7 +100,7 @@ std::string ReadFile(const std::filesystem::path& path) {
 }
 
 int main() {
-    const auto valid_plan = MakeAtomicImagePlan(Prospero::BufferFormat::k32UInt);
+    const auto                 valid_plan = MakeAtomicImagePlan(Prospero::BufferFormat::k32UInt);
     IR::SrtRuntime             runtime {};
     IR::ResourceSnapshot       valid_snap;
     IR::ResourceSpecialization valid_spec;
@@ -73,6 +111,9 @@ int main() {
                           ("kyty-image-format-diag-" +
                            std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) +
                            ".log");
+    const int stderr_fd = FilenoStream(stderr);
+    const int saved_fd  = DupFd(stderr_fd);
+    Require(saved_fd >= 0, "failed to duplicate stderr");
     FILE* redirected = std::freopen(log_path.string().c_str(), "w", stderr);
     Require(redirected != nullptr, "failed to redirect stderr");
 
@@ -81,7 +122,10 @@ int main() {
     IR::ResourceSpecialization invalid_spec;
     const bool ok = IR::MaterializeResources(invalid_plan, runtime, invalid_snap, invalid_spec);
     std::fflush(stderr);
-    std::freopen("NUL", "w", stderr);
+    const int restored = Dup2Fd(saved_fd, stderr_fd);
+    CloseFd(saved_fd);
+    Require(restored >= 0, "failed to restore stderr");
+
     const std::string log = ReadFile(log_path);
     std::error_code   ec;
     std::filesystem::remove(log_path, ec);
@@ -90,7 +134,7 @@ int main() {
     if (log.find("atomic image descriptor 0 uses unsupported format 5: root=0 source=0 "
                  "first_use_pc=0x1234 r128=false words=00001000,c0500000,0000000f,90000fac,"
                  "00000000,00000000,00000000,00000000") == std::string::npos) {
-        std::fprintf(stdout, "unexpected log: %s\n", log.c_str());
+        std::fprintf(stderr, "unexpected log: %s\n", log.c_str());
         return 1;
     }
 
