@@ -590,7 +590,7 @@ public:
 			if (!m_busy.insert(l).second) return {Opaque(*l, 64)};
 			Choices result;
 			for (size_t index = 0; index < l->NumArgs(); ++index) {
-				if (Unreached(*l, index)) continue;
+				if (Unreached(*l, index, h)) continue;
 				const auto from = l->PhiBlock(index);
 				Append(result, Pair(l->Arg(index), Incoming(*h, from), depth + 1));
 			}
@@ -1004,8 +1004,13 @@ private:
 		std::vector<const Inst*> products;
 	};
 
-	[[nodiscard]] bool Unreached(const Inst& phi, size_t index) const {
-		return m_reach != nullptr && m_target != nullptr && m_reach->Dead(phi.Parent(), phi.PhiBlock(index), m_target);
+	[[nodiscard]] bool Unreached(const Inst& phi, size_t index, const Inst* high = nullptr) const {
+		const auto* join = phi.Parent();
+		if (m_reach == nullptr || m_target == nullptr || !m_reach->Dead(join, phi.PhiBlock(index), m_target)) return false;
+		const auto used_at_join = [join](const Inst& part) {
+			return std::ranges::any_of(part.Uses(), [join](const Use& use) { return use.user->Parent() == join; });
+		};
+		return !used_at_join(phi) && (high == nullptr || !used_at_join(*high));
 	}
 
 	Evaluator& Given(Value fact) {
@@ -1179,13 +1184,9 @@ private:
 	}
 
 	std::optional<uint32_t> JoinedPhi(const Inst& low, const Inst& high) {
-		const auto used_at_join = [](const Inst& phi) {
-			return std::ranges::any_of(phi.Uses(), [&](const Use& use) { return use.user->Parent() == phi.Parent(); });
-		};
-		const bool can_prune = !used_at_join(low) && !used_at_join(high);
 		std::optional<uint32_t> result;
 		for (size_t index = 0; index < low.NumArgs(); ++index) {
-			if (can_prune && Unreached(low, index)) continue;
+			if (Unreached(low, index, &high)) continue;
 			const auto lower = Word(low.Arg(index));
 			const auto upper = Word(Incoming(high, low.PhiBlock(index)));
 			if (lower.size() != 1 || upper.size() != 1) return std::nullopt;

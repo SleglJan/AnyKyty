@@ -591,7 +591,7 @@ void ComputedHeader(ChasedSource source) {
     Expect(!unreadable, "a program whose pointer chain is unreadable yields no header");
 }
 
-enum class WalkGuard { Blocked, Reachable, MixedVote, VoteAtJoin };
+enum class WalkGuard { Blocked, Reachable, MixedVote, VoteAtJoin, Broadcast };
 
 IR::OracleWalks GuardedWalks(WalkGuard guard, bool carried = false) {
     using Op = IR::ValueOpcode;
@@ -622,6 +622,10 @@ IR::OracleWalks GuardedWalks(WalkGuard guard, bool carried = false) {
             later = walk.Add(Op::LogicalNot, {lane_zero});
             break;
         }
+        case WalkGuard::Broadcast:
+            skip = walk.Add(Op::INotEqual32, {walk.Add(Op::LaneId, {}), u32(0)});
+            later = IR::Value(false);
+            break;
         case WalkGuard::VoteAtJoin:
             skip = walk.Add(Op::IEqual32, {walk.Add(Op::LaneId, {}), u32(0)});
             break;
@@ -667,8 +671,12 @@ IR::OracleWalks GuardedWalks(WalkGuard guard, bool carried = false) {
     join.terminator.merge_block = &exit;
     join.AddBranch(&second_pre);
     join.AddBranch(&exit);
-    BuildWalk(walk, {second_pre, walk.second_header, walk.second_body, walk.second_latch, walk.second_merge},
-              {IR::Value(&header_low), IR::Value(&header_high)}, ray, carried ? HighWord::Exact : HighWord::Masked, false, carried);
+    std::array<IR::Value, 2> header {IR::Value(&header_low), IR::Value(&header_high)};
+    if (guard == WalkGuard::Broadcast) {
+        for (auto& value: header) value = walk.Add(Op::ReadFirstLane, {value, IR::Value(true)});
+    }
+    BuildWalk(walk, {second_pre, walk.second_header, walk.second_body, walk.second_latch, walk.second_merge}, header, ray,
+              carried ? HighWord::Exact : HighWord::Masked, false, carried);
     Link(walk.second_merge, exit);
     return IR::DeriveOracleWalks(walk.program, walk.sites);
 }
@@ -688,6 +696,7 @@ void UnreachableEdgeWalks() {
     };
     Expect(rejects_second(WalkGuard::Reachable), "a full-width record read that can reach the walk still rejects the TLAS");
     Expect(rejects_second(WalkGuard::MixedVote), "a positive wave vote leaves other lanes free to carry a full-width record to the walk");
+    Expect(rejects_second(WalkGuard::Broadcast), "a lane can pass its phi input to a lane that reaches the walk");
     Expect(rejects_second(WalkGuard::VoteAtJoin), "a wave vote at the join includes lanes from both phi inputs");
     const auto carried = GuardedWalks(WalkGuard::Blocked, true);
     if (carried.refusal != nullptr) std::fprintf(stderr, "carried edge walks refused: %s\n", carried.refusal);
