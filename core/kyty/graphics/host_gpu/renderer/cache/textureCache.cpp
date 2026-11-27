@@ -4072,13 +4072,15 @@ void TextureCache::RunGarbageCollector() {
 		uint64_t age        = 16;
 		size_t   deletions  = 10;
 		if (aggressive) {
-			age       = 2;
+			age       = 160;
 			deletions = 40;
 		} else if (pressured) {
-			age       = 8;
+			age       = GcDownloadAge;
 			deletions = 20;
 		}
-		age = std::min(age, tick);
+		if (tick < age) {
+			return;
+		}
 		std::vector<ImageId> candidates;
 		m_lru_cache.ForEachItemBelow(tick - age, [&](ImageId id) { candidates.push_back(id); });
 		for (const auto id: candidates) {
