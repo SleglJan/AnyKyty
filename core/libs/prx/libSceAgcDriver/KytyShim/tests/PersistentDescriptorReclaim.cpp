@@ -2,6 +2,7 @@
 #include "graphics/host_gpu/renderer/masterSemaphore.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptorHeap.h"
 
+#include <algorithm>
 #include <array>
 #include <cstdio>
 
@@ -90,7 +91,7 @@ int main() {
 		failures += Check(heap.ActivePersistentPoolCount() == 2, "active count after reuse");
 		failures += Check(heap.RetiredPersistentPoolCount() == 0, "retired count after reuse");
 
-		const uint64_t tick_2 = semaphore.NextTick();
+		const uint64_t tick_2 = std::max(semaphore.NextTick(), in_flight_tick + 1);
 		heap.RetirePersistent(set_a2, tick_2);
 		if (vulkan.graphics.device.signalSemaphore(
 		        vk::SemaphoreSignalInfo {.semaphore = semaphore.Handle(), .value = tick_2}) !=

@@ -3295,7 +3295,8 @@ RenderExecutor::TableBindingState::RingSet* RenderExecutor::AcquireTableRingSet(
 			return nullptr;
 		}
 		m_context.GetDescriptorHeap().RetirePersistent(evict->set, evict->tick);
-		state.ring.erase(evict);
+		*evict = state.ring.back();
+		state.ring.pop_back();
 	}
 	auto& entry  = state.ring.emplace_back();
 	entry.set    = m_context.GetDescriptorHeap().CommitPersistent(layout);
