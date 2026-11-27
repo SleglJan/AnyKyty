@@ -1271,7 +1271,28 @@ private:
 			case ValueOpcode::BitCastU32F32:
 			case ValueOpcode::ReadFirstLane: return Lift(inst->Arg(0), depth + 1, leaves);
 			case ValueOpcode::Phi:
-				if (!m_order.Carried(*inst)) break;
+				if (!m_order.Carried(*inst)) {
+					for (const auto leaf: leaves) {
+						const auto* high = leaf.Resolve().TryInstruction();
+						if (high == nullptr || high == inst || high->GetOpcode() != ValueOpcode::Phi || high->Parent() != inst->Parent() ||
+						    m_order.Carried(*high) || !m_busy.insert(inst).second) {
+							continue;
+						}
+						const auto start = result.size();
+						for (size_t index = 0; index < inst->NumArgs(); ++index) {
+							if (Unreached(*inst, index)) continue;
+							const auto partner = Incoming(*high, inst->PhiBlock(index));
+							const auto pairs   = partner.IsEmpty() ? Choices {} : Pair(inst->Arg(index), partner, depth + 1);
+							if (pairs.empty()) {
+								result.resize(start);
+								break;
+							}
+							for (const auto wide: pairs) result.push_back({wide, m_store.Hi(wide), {}});
+						}
+						m_busy.erase(inst);
+					}
+					break;
+				}
 				for (const auto leaf: leaves) {
 					const auto* high = leaf.Resolve().TryInstruction();
 					if (high == nullptr || high == inst || !m_order.Carried(*high) || high->Parent() != inst->Parent()) continue;

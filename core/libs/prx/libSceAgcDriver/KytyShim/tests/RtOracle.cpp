@@ -318,7 +318,8 @@ std::array<IR::Value, 6> UserRay(SourceWalk& walk) {
     return ray;
 }
 
-void BuildWalk(SourceWalk& walk, const Loop& loop, std::array<IR::Value, 2> header, const std::array<IR::Value, 6>& ray, HighWord kind, bool scalar_blas = false) {
+void BuildWalk(SourceWalk& walk, const Loop& loop, std::array<IR::Value, 2> header, const std::array<IR::Value, 6>& ray, HighWord kind, bool scalar_blas = false,
+               bool offset_first = false) {
     using Op               = IR::ValueOpcode;
     const auto u32         = [](uint32_t value) { return IR::Value(value); };
     const auto word        = static_cast<uint64_t>(IR::Type::U32);
@@ -357,9 +358,11 @@ void BuildWalk(SourceWalk& walk, const Loop& loop, std::array<IR::Value, 2> head
 
     walk.block       = &loop.latch;
     const auto table = walk.Add(Op::GetAddressResource, {header_low, header_high});
-    const auto low   = walk.Add(Op::IAdd32, {header_low, walk.LoadAddress(table, 0x30)});
-    const auto carry = walk.Add(Op::SelectU32, {walk.Add(Op::ULessThan32, {low, header_low}), u32(1), u32(0)});
-    auto       high  = walk.Add(Op::IAdd32, {walk.Add(Op::IAdd32, {header_high, walk.LoadAddress(table, 0x34)}), carry});
+    const auto offset_low  = walk.LoadAddress(table, 0x30);
+    const auto offset_high = walk.LoadAddress(table, 0x34);
+    const auto low   = offset_first ? walk.Add(Op::IAdd32, {offset_low, header_low}) : walk.Add(Op::IAdd32, {header_low, offset_low});
+    const auto carry = walk.Add(Op::SelectU32, {walk.Add(Op::ULessThan32, {low, offset_first ? offset_low : header_low}), u32(1), u32(0)});
+    auto       high  = walk.Add(Op::IAdd32, {offset_first ? walk.Add(Op::IAdd32, {offset_high, header_high}) : walk.Add(Op::IAdd32, {header_high, offset_high}), carry});
     if (kind == HighWord::StrideBit) high = walk.Add(Op::IAdd32, {high, u32(0x00010000u)});
     if (kind == HighWord::SwizzleBit) high = walk.Add(Op::BitwiseOr32, {high, u32(0x40000000u)});
     if (kind == HighWord::Masked) high = walk.Add(Op::BitwiseAnd32, {high, u32(0xffffu)});
@@ -584,7 +587,7 @@ void ComputedHeader(ChasedSource source) {
 
 enum class WalkGuard { Blocked, Reachable, MixedVote, VoteAtJoin };
 
-IR::OracleWalks GuardedWalks(WalkGuard guard) {
+IR::OracleWalks GuardedWalks(WalkGuard guard, bool carried = false) {
     using Op = IR::ValueOpcode;
     IR::Block   pre, join, second_pre, exit;
     SourceWalk  walk;
@@ -636,7 +639,12 @@ IR::OracleWalks GuardedWalks(WalkGuard guard) {
     const auto record = [&](uint32_t dword) {
         return walk.Load(Op::LoadBufferU32, {buffer, index, u32(0), u32(0), IR::Value(true)}, dword * 4u, true);
     };
-    const std::array<IR::Value, 2> raw {record(12), record(13)};
+    std::array<IR::Value, 2> raw {record(12), record(13)};
+    if (carried) {
+        auto phi = walk.header.Instructions().begin();
+        raw[0]   = IR::Value(&*phi);
+        raw[1]   = IR::Value(&*++phi);
+    }
     Link(walk.merge, join);
 
     walk.block       = &join;
@@ -659,7 +667,7 @@ IR::OracleWalks GuardedWalks(WalkGuard guard) {
     join.AddBranch(&second_pre);
     join.AddBranch(&exit);
     BuildWalk(walk, {second_pre, walk.second_header, walk.second_body, walk.second_latch, walk.second_merge},
-              {IR::Value(&header_low), IR::Value(&header_high)}, ray, HighWord::Masked);
+              {IR::Value(&header_low), IR::Value(&header_high)}, ray, carried ? HighWord::Exact : HighWord::Masked, false, carried);
     Link(walk.second_merge, exit);
     return IR::DeriveOracleWalks(walk.program, walk.sites);
 }
@@ -680,6 +688,13 @@ void UnreachableEdgeWalks() {
     Expect(rejects_second(WalkGuard::Reachable), "a full-width record read that can reach the walk still rejects the TLAS");
     Expect(rejects_second(WalkGuard::MixedVote), "a positive wave vote leaves other lanes free to carry a full-width record to the walk");
     Expect(rejects_second(WalkGuard::VoteAtJoin), "a wave vote at the join includes lanes from both phi inputs");
+    const auto carried = GuardedWalks(WalkGuard::Blocked, true);
+    if (carried.refusal != nullptr) std::fprintf(stderr, "carried edge walks refused: %s\n", carried.refusal);
+    Expect(carried.refusal == nullptr && bound(carried, 0) == 0x40u && bound(carried, 1) == 0x20u,
+           "a descriptor base offset from header words whose other edge cannot reach the walk is bounded");
+    const auto live = GuardedWalks(WalkGuard::Reachable, true);
+    Expect(live.refusal != nullptr && std::strcmp(live.refusal, "a buffer descriptor's high word is not proven to leave the stride bits clear") == 0,
+           "a descriptor base offset from a carried value that can reach the walk is still refused");
 }
 
 void HeaderPrograms() {
