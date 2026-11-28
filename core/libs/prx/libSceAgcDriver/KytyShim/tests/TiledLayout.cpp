@@ -7,6 +7,7 @@
 
 namespace {
 
+using Libs::Graphics::ColorTransform;
 using Libs::Graphics::ImageInfo;
 using Libs::Graphics::Prospero::BufferFormat;
 using Libs::Graphics::Prospero::ImageType;
@@ -80,6 +81,17 @@ void TexturesWithLayouts() {
     LaidOut(volume, "a 64 KB tiled volume is laid out");
 }
 
+void PackedColorTransforms() {
+    static_assert(static_cast<uint32_t>(BufferFormat::k2_10_10_10UNorm) == 44u);
+    static_assert(static_cast<uint32_t>(BufferFormat::k10_10_10_2UNorm) == 50u);
+    const auto lowBits = Texture(static_cast<uint32_t>(BufferFormat::k2_10_10_10UNorm), 0, 1, 1, 1);
+    const auto highBits = Texture(static_cast<uint32_t>(BufferFormat::k10_10_10_2UNorm), 0, 1, 1, 1);
+    Require(lowBits.GetColorTransform() == ColorTransform::Rotate2_10_10_10,
+            "format 44 rotates the low two bits for Vulkan");
+    Require(highBits.GetColorTransform() == ColorTransform::None,
+            "format 50 uses Vulkan channel order");
+}
+
 void OtherStopsStay() {
     auto multisampled = Texture(77, 19, 64, 64, 1);
     multisampled.samples = 4;
@@ -103,6 +115,7 @@ int main(int argc, char** argv) {
     KnownTileModesWithoutBlocks();
     FormatsWithoutElements();
     TexturesWithLayouts();
+    PackedColorTransforms();
     OtherStopsStay();
     std::puts("kyty_shim_tiled_layout: ok");
     return 0;
