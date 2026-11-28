@@ -15,6 +15,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <utility>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -94,7 +95,7 @@ const char* CheckFilledMetaClearReachesBind(GraphicContext& graphics, uint64_t b
 	constexpr uint64_t MetaOffset = 0x6000;
 	constexpr uint64_t SourceOffset = 0x7000;
 	constexpr uint64_t WriteBytes = 16;
-	constexpr uint32_t Cases = 28;
+	constexpr uint32_t Cases = 31;
 	static_assert(Stride * Cases <= DepthGuestBytes);
 	constexpr uint32_t Expanded = 0xffffffffu;
 	constexpr uint32_t StencilCleared = 0xf0u;
@@ -352,6 +353,53 @@ const char* CheckFilledMetaClearReachesBind(GraphicContext& graphics, uint64_t b
 		       fill(meta + SliceBytes, SliceBytes, 0);
 	       }),
 	       both, "fills in memory of both layers' HTile on one page did not clear both layers");
+	const auto depth = [&](uint64_t depth_address, uint64_t meta_address, uint32_t layers) {
+		ImageInfo info;
+		info.data.address = depth_address;
+		info.pixel_format = vk::Format::eD16Unorm;
+		info.guest_format = Prospero::BufferFormat::k16UNorm;
+		info.extent = vk::Extent3D {Width, Height, 1};
+		info.pitch = Width;
+		info.bytes_per_block = sizeof(uint16_t);
+		info.resources = {1, layers};
+		info.UpdateSize();
+		info.metadata.kind = ImageMetadataKind::Htile;
+		info.metadata.range = GuestRange {meta_address, SliceBytes * layers};
+		info.htile_initial_clear = false;
+		TextureCache::ImageDesc desc {.info = info};
+		desc.type = TextureCache::BindingType::DepthTarget;
+		desc.view_info.format = info.pixel_format;
+		desc.view_info.type = vk::ImageViewType::e2DArray;
+		desc.view_info.aspect = vk::ImageAspectFlagBits::eDepth;
+		desc.view_info.base_level = 0;
+		desc.view_info.level_count = 1;
+		desc.view_info.base_layer = 0;
+		desc.view_info.layer_count = layers;
+		desc.view_info.usage = vk::ImageUsageFlagBits::eDepthStencilAttachment;
+		return std::pair {TextureCacheTestAccess::Create(textures, info), desc};
+	};
+	const auto acquire = [&](const std::pair<ImageId, TextureCache::ImageDesc>& target) {
+		(void)textures.FindDepthTarget(target.first, target.second, nullptr);
+		const auto meta = target.second.info.metadata.range.address;
+		return std::array<bool, 2> {textures.IsMetaCleared(meta, 0), textures.IsMetaCleared(meta, 1)};
+	};
+	const auto takeover = [&](uint32_t value, bool rebind) {
+		const auto depth_address = next;
+		const auto meta = next + MetaOffset;
+		next += Stride;
+		const auto older = depth(depth_address, meta, 1);
+		(void)acquire(older);
+		textures.NoteMetaFill(meta, MetaBytes, value, false);
+		if (rebind) (void)acquire(older);
+		return acquire(depth(depth_address + Width * Height * sizeof(uint16_t), meta, Layers));
+	};
+	expect(takeover(0, false), both,
+	       "a fill on the GPU at an HTile entry owned by an older target with a one-slice range did not clear both layers of "
+	       "the target that takes the entry over");
+	expect(takeover(Expanded, false), none,
+	       "a fill on the GPU with the expanded value cleared the target that takes over the entry of an older target");
+	expect(takeover(0, true), none,
+	       "a fill on the GPU followed by a bind of the entry's owner cleared the target that takes the entry over later");
 	const auto tick = scheduler.CurrentTick();
 	scheduler.Wait(tick);
 	scheduler.WaitPriorityOperations(tick);
