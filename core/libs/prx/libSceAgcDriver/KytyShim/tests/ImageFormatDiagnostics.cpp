@@ -8,10 +8,48 @@
 #include <iterator>
 #include <string>
 
+#if defined(_WIN32)
+#include <io.h>
+#else
+#include <unistd.h>
+#endif
+
 namespace {
 
 using namespace Libs::Graphics;
 using namespace Libs::Graphics::ShaderRecompiler;
+
+int DupFd(int fd) {
+#if defined(_WIN32)
+    return _dup(fd);
+#else
+    return dup(fd);
+#endif
+}
+
+int Dup2Fd(int src, int dst) {
+#if defined(_WIN32)
+    return _dup2(src, dst);
+#else
+    return dup2(src, dst);
+#endif
+}
+
+int CloseFd(int fd) {
+#if defined(_WIN32)
+    return _close(fd);
+#else
+    return close(fd);
+#endif
+}
+
+int FilenoStream(FILE* stream) {
+#if defined(_WIN32)
+    return _fileno(stream);
+#else
+    return fileno(stream);
+#endif
+}
 
 void Require(bool condition, const char* message) {
     if (condition) return;
@@ -73,6 +111,9 @@ int main() {
                           ("kyty-image-format-diag-" +
                            std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) +
                            ".log");
+    const int stderr_fd = FilenoStream(stderr);
+    const int saved_fd  = DupFd(stderr_fd);
+    Require(saved_fd >= 0, "failed to duplicate stderr");
     FILE* redirected = std::freopen(log_path.string().c_str(), "w", stderr);
     Require(redirected != nullptr, "failed to redirect stderr");
 
@@ -84,7 +125,10 @@ int main() {
         Require(!IR::MaterializeResources(*plan, runtime, snapshot, spec),
                 "unsupported image format unexpectedly materialized");
     }
-    Require(std::fclose(redirected) == 0, "failed to flush diagnostic log");
+    Require(std::fflush(stderr) == 0, "failed to flush diagnostic log");
+    const int restored = Dup2Fd(saved_fd, stderr_fd);
+    CloseFd(saved_fd);
+    Require(restored >= 0, "failed to restore stderr");
     const std::string log = ReadFile(log_path);
     std::filesystem::remove(log_path);
 
