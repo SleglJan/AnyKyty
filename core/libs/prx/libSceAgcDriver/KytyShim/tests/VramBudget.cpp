@@ -9,6 +9,7 @@
 #include "kernel/memory.h"
 #include "prx/libkernel/include/Api.hpp"
 
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -40,6 +41,10 @@ struct VramBudgetTestAccess {
 	static ImageId CreateImage(TextureCache& cache, const ImageInfo& info) {
 		Common::ScopedLock lock {cache.m_lock};
 		return cache.InsertImage(info);
+	}
+
+	static void Collect(TextureCache& cache, std::chrono::steady_clock::time_point now) {
+		cache.CollectAt(now);
 	}
 
 	static bool IsImageRegistered(TextureCache& cache, ImageId id) {
@@ -177,25 +182,31 @@ const char* CheckGuestEviction(GraphicContext& graphics, TextureCache& textures,
 	info.pitch        = 64;
 	info.UpdateSize();
 
-	const auto id = VramBudgetTestAccess::CreateImage(textures, info);
-	if (!VramBudgetTestAccess::IsImageRegistered(textures, id)) {
-		return "test image was not registered";
+	auto now = std::chrono::steady_clock::time_point {};
+	const auto check_age = [&](uint64_t usage, unsigned idle_passes) -> const char* {
+		VramBudgetTestAccess::SetReportedMemory(graphics, 6 * GiB, usage);
+		const auto id = VramBudgetTestAccess::CreateImage(textures, info);
+		if (!VramBudgetTestAccess::IsImageRegistered(textures, id)) {
+			return "test image was not registered";
+		}
+		for (unsigned pass = 0; pass < idle_passes; ++pass) {
+			now += std::chrono::milliseconds(1);
+			VramBudgetTestAccess::Collect(textures, now);
+		}
+		if (!VramBudgetTestAccess::IsImageRegistered(textures, id)) {
+			return "texture was evicted before the idle age for its pressure band";
+		}
+		now += std::chrono::milliseconds(1);
+		VramBudgetTestAccess::Collect(textures, now);
+		if (VramBudgetTestAccess::IsImageRegistered(textures, id)) {
+			return "texture was retained at the idle age for its pressure band";
+		}
+		return nullptr;
+	};
+	if (const auto* failure = check_age(3 * GiB, 80)) {
+		return failure;
 	}
-
-	VramBudgetTestAccess::SetReportedMemory(graphics, 6 * GiB, 6 * GiB);
-	for (uint32_t i = 0; i < 16; i++) {
-		textures.RunGarbageCollector();
-	}
-	if (!VramBudgetTestAccess::IsImageRegistered(textures, id)) {
-		return "critical memory pressure evicted a texture unused for only 16 ticks";
-	}
-	for (uint32_t i = 16; i < 165; i++) {
-		textures.RunGarbageCollector();
-	}
-	if (VramBudgetTestAccess::IsImageRegistered(textures, id)) {
-		return "critical memory pressure did not evict an unused texture after 160 ticks";
-	}
-	return nullptr;
+	return check_age(6 * GiB, 160);
 }
 
 const char* CheckVramCase(GraphicContext& graphics, uint64_t address) {

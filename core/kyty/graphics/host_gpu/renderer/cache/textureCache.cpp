@@ -4072,12 +4072,13 @@ void TextureCache::CollectAt(std::chrono::steady_clock::time_point now) {
 		return;
 	}
 	const auto collect = [&](bool allow_aggressive) KYTY_REQUIRES(m_lock) {
-		bool     pressured  = m_total_used_memory >= m_pressure_gc_memory;
-		bool     aggressive = allow_aggressive && m_total_used_memory >= m_critical_gc_memory;
-		size_t   deletions  = aggressive ? 40 : pressured ? 20 : 10;
-		const auto cutoff = aggressive ? m_gc_history.Cutoff<GcCriticalAge>(tick)
-		                  : pressured  ? m_gc_history.Cutoff<GcDownloadAge>(tick)
-		                               : m_gc_history.Cutoff<16>(tick);
+		const bool critical   = m_total_used_memory >= m_critical_gc_memory;
+		bool       pressured  = m_total_used_memory >= m_pressure_gc_memory;
+		bool       aggressive = allow_aggressive && critical;
+		size_t     deletions  = aggressive ? 40 : pressured ? 20 : 10;
+		const auto cutoff = critical  ? m_gc_history.Cutoff<GcCriticalAge>(tick)
+		                  : pressured ? m_gc_history.Cutoff<GcDownloadAge>(tick)
+		                              : m_gc_history.Cutoff<16>(tick);
 		if (!cutoff) {
 			return;
 		}

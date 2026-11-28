@@ -5,28 +5,33 @@
 #include <cstdio>
 #include <optional>
 
-int main() {
+template <size_t Age>
+bool CheckCutoff() {
 	using namespace std::chrono_literals;
-	using History = Libs::Graphics::CacheGcHistory<16>;
+	using History = Libs::Graphics::CacheGcHistory<160>;
 	History history;
-	std::array<History::Clock::time_point, 96> ends {};
+	std::array<History::Clock::time_point, 640> ends {};
 	auto now = History::Clock::time_point {};
 	for (size_t pass = 0; pass < ends.size(); ++pass) {
 		auto interval = pass % 32 < 16 ? 8ms : 16ms;
-		if (pass % 32 == 0) interval = 2857ms;
+		if (pass % 192 == 0) interval = 2857ms;
 		now += interval;
 		ends[pass] = now;
 		history.FinishPass(pass, now);
 		std::optional<uint64_t> expected;
 		for (size_t last = 0; last <= pass; ++last) {
-			if (pass - last >= 16 || (pass - last >= 3 && now - ends[last] >= 256ms)) {
+			if (pass - last >= Age || (pass - last >= 3 && now - ends[last] >= 16ms * Age)) {
 				expected = last;
 			}
 		}
-		if (history.Cutoff<16>(pass) != expected) {
-			std::fprintf(stderr, "incorrect idle cutoff on pass %zu\n", pass);
-			return 1;
+		if (history.Cutoff<Age>(pass) != expected) {
+			std::fprintf(stderr, "incorrect idle cutoff for age %zu on pass %zu\n", Age, pass);
+			return false;
 		}
 	}
-	return 0;
+	return true;
+}
+
+int main() {
+	return CheckCutoff<16>() && CheckCutoff<80>() && CheckCutoff<160>() ? 0 : 1;
 }
