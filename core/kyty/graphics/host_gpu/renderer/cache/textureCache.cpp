@@ -2840,8 +2840,10 @@ vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc, I
 	image.info.metadata = desc.info.metadata;
 	if (desc.info.HasMetadata()) {
 		const auto [metadata, inserted] = m_surface_metas.try_emplace(desc.info.metadata.range.address);
-		if (inserted) {
+		if (inserted || metadata->second.owner != id) {
 			ApplyPendingMetaClears(image.info, metadata->second);
+		} else {
+			DropPendingMetaClears(image.info.metadata.range.address, image.info.metadata.range.size);
 		}
 		if (inserted && image.info.htile_initial_clear) {
 			metadata->second.clear_mask.set();
@@ -3720,10 +3722,11 @@ bool TextureCache::CoversMeta(uint64_t address, uint64_t size) {
 	return size >= info.metadata.range.size / std::max(info.resources.layers, 1u) && size <= info.metadata.range.size;
 }
 
-bool TextureCache::OverlapsSurfaceMetaLocked(uint64_t address, uint64_t size) const {
+bool TextureCache::OverlapsOtherSurfaceMetaLocked(uint64_t address, uint64_t size) const {
 	const uint64_t end   = size > UINT64_MAX - address ? UINT64_MAX : address + size;
 	auto           found = m_surface_metas.lower_bound(address);
-	if (found != m_surface_metas.end() && found->first < end) {
+	const auto     next  = found != m_surface_metas.end() && found->first == address ? std::next(found) : found;
+	if (next != m_surface_metas.end() && next->first < end) {
 		return true;
 	}
 	if (found == m_surface_metas.begin()) {
@@ -3745,7 +3748,7 @@ void TextureCache::NoteMetaFill(uint64_t address, uint64_t size, uint32_t value,
 		return;
 	}
 	Common::ScopedLock lock {m_lock};
-	if (OverlapsSurfaceMetaLocked(address, size)) {
+	if (OverlapsOtherSurfaceMetaLocked(address, size)) {
 		return;
 	}
 	Common::ScopedLock pending {m_pending_meta_lock};

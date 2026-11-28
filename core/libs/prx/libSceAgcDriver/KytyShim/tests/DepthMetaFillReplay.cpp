@@ -34,6 +34,7 @@ constexpr std::uint64_t ImageCode = GuestBase + 0xa00;
 constexpr std::uint64_t FillCode = GuestBase + 0xb00;
 constexpr std::uint64_t Commands = GuestBase + 0x1000;
 constexpr std::uint64_t Depth = GuestBase + Block;
+constexpr std::uint64_t PriorDepth = GuestBase + 6 * Block;
 constexpr std::uint64_t Htile = GuestBase + 3 * Block;
 constexpr std::uint64_t Color = GuestBase + 4 * Block;
 constexpr std::uint64_t GuestBytes = 8 * Block;
@@ -79,16 +80,19 @@ struct Case {
     std::uint64_t bytes;
     bool overwrite;
     bool alias;
+    bool takeover;
 };
 
 constexpr std::array Cases{
-    Case{"expanded", true, Expanded, Layers * HtileSliceBytes, false, false},
-    Case{"cleared", true, Cleared, Layers * HtileSliceBytes, false, false},
-    Case{"first-layer", true, Cleared, HtileSliceBytes, false, false},
-    Case{"overwritten", true, Cleared, Layers * HtileSliceBytes, true, false},
-    Case{"consumed", false, Cleared, Layers * HtileSliceBytes, false, false},
-    Case{"alias-written", true, Cleared, Layers * HtileSliceBytes, true, true},
-    Case{"alias-kept", true, Cleared, Layers * HtileSliceBytes, false, true},
+    Case{"expanded", true, Expanded, Layers * HtileSliceBytes, false, false, false},
+    Case{"cleared", true, Cleared, Layers * HtileSliceBytes, false, false, false},
+    Case{"first-layer", true, Cleared, HtileSliceBytes, false, false, false},
+    Case{"overwritten", true, Cleared, Layers * HtileSliceBytes, true, false, false},
+    Case{"consumed", false, Cleared, Layers * HtileSliceBytes, false, false, false},
+    Case{"alias-written", true, Cleared, Layers * HtileSliceBytes, true, true, false},
+    Case{"alias-kept", true, Cleared, Layers * HtileSliceBytes, false, true, false},
+    Case{"takeover-cleared", true, Cleared, Layers * HtileSliceBytes, false, false, true},
+    Case{"takeover-expanded", true, Expanded, Layers * HtileSliceBytes, false, false, true},
 };
 
 std::uint32_t low(std::uint64_t address) {
@@ -130,7 +134,7 @@ void appendFill(std::vector<std::uint32_t>& words, std::uint32_t value, std::uin
 }
 
 void appendDraw(std::vector<std::uint32_t>& words, bool htile, std::uint32_t view, std::uint32_t depth_control,
-                std::uint32_t left, std::uint32_t right) {
+                std::uint32_t left, std::uint32_t right, std::uint64_t depth) {
     const std::pair<std::uint32_t, std::uint32_t> context[]{
         {0x2d5, 0x2000},
         {0x1b3, 0x2}, {0x1b4, 0x2}, {0x1b6, 0}, {0x207, 0}, {0x200, depth_control}, {0x203, 0},
@@ -156,7 +160,7 @@ void appendDraw(std::vector<std::uint32_t>& words, bool htile, std::uint32_t vie
         {0x008, 0}, {0x009, bits(1.0f)}, {0x00a, 0}, {0x00b, bits(1.0f)},
         {0x010, 3u | (htile ? HtileEnable : 0u)}, {0x011, 0},
         {0x005, htile ? low(Htile) : 0u}, {0x01e, htile ? high(Htile) : 0u},
-        {0x012, low(Depth)}, {0x014, low(Depth)}, {0x01a, high(Depth)}, {0x01c, high(Depth)},
+        {0x012, low(depth)}, {0x014, low(depth)}, {0x01a, high(depth)}, {0x01c, high(depth)},
         {0x013, 0}, {0x015, 0}, {0x01b, 0}, {0x01d, 0},
     };
     const std::pair<std::uint32_t, std::uint32_t> shader[]{
@@ -171,8 +175,9 @@ void appendDraw(std::vector<std::uint32_t>& words, bool htile, std::uint32_t vie
 
 std::vector<std::uint32_t> primeWords(const Case& test) {
     std::vector<std::uint32_t> words;
-    appendDraw(words, false, 0, ZEnableNever, 0, Width);
+    appendDraw(words, false, 0, ZEnableNever, 0, Width, Depth);
     if (test.image) appendImageWrite(words);
+    if (test.takeover) appendDraw(words, true, 0, ZEnableNever, 0, Width, PriorDepth);
     return words;
 }
 
@@ -184,8 +189,8 @@ std::vector<std::uint32_t> fillWords(const Case& test) {
 
 std::vector<std::uint32_t> bindWords() {
     std::vector<std::uint32_t> words;
-    appendDraw(words, true, ViewSecond, ZEnableLess, Width / 2u, Width);
-    appendDraw(words, true, ViewFirst, ZEnableLess, 0, Width / 2u);
+    appendDraw(words, true, ViewSecond, ZEnableLess, Width / 2u, Width, Depth);
+    appendDraw(words, true, ViewFirst, ZEnableLess, 0, Width / 2u, Depth);
     return words;
 }
 
@@ -409,6 +414,14 @@ int main(int argc, char** argv) {
         if (lit(6, false) || lit(6, true)) {
             failures.emplace_back("a fill on the GPU of an HTile mapped twice cleared depth at the bind, so its record was not "
                                   "declined");
+        }
+        if (!lit(7, false)) {
+            failures.emplace_back("a fill that clears a new depth target's HTile while an older target with a different HTile size "
+                                  "owns the entry did not clear the new target's first layer at its bind");
+        }
+        if (lit(8, false)) {
+            failures.emplace_back("a fill with the expanded value over an HTile entry that an older target owns cleared the new "
+                                  "target's first layer at its bind");
         }
         if (results[4].log.find(ConsumedFill) == std::string::npos) {
             failures.emplace_back("a fill over an unregistered HTile range printed no consumed fill, so the check that the other "

@@ -376,7 +376,7 @@ private:
 	    KYTY_REQUIRES(m_pending_meta_lock);
 	void HoldPendingMetaPagesLocked(uint64_t address, uint64_t size, bool hold) KYTY_REQUIRES(m_pending_meta_lock);
 	void DropPendingMetaClearsAround(uint64_t address, uint64_t size);
-	[[nodiscard]] bool        OverlapsSurfaceMetaLocked(uint64_t address, uint64_t size) const KYTY_REQUIRES(m_lock);
+	[[nodiscard]] bool        OverlapsOtherSurfaceMetaLocked(uint64_t address, uint64_t size) const KYTY_REQUIRES(m_lock);
 	[[nodiscard]] bool        MaybePendingMeta(uint64_t address, uint64_t end) const;
 	static void               AddPendingMetaGranules(std::array<uint64_t, 64>& words, uint64_t address, uint64_t size);
 	void                      TouchImage(Image& image) KYTY_NO_THREAD_SAFETY_ANALYSIS;
