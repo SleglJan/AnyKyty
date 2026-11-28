@@ -325,7 +325,8 @@ extern "C" int RunKytyVramBudgetTest(int mode) {
 			return 1;
 		}
 		if (skipped) {
-			std::fprintf(stderr, "%s: skipped, the device reports no supported spill path (requires a discrete GPU, spill allocator, and 4 GiB device-local heap)\n", name);
+			std::fprintf(stderr, "%s: skipped, the device reports no supported spill path "
+			                     "(requires a discrete GPU, spill allocator, and 4 GiB device-local heap)\n", name);
 			return 77;
 		}
 		if (mode == 2) {
