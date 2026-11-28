@@ -183,11 +183,17 @@ const char* CheckGuestEviction(GraphicContext& graphics, TextureCache& textures,
 	}
 
 	VramBudgetTestAccess::SetReportedMemory(graphics, 6 * GiB, 6 * GiB);
-	for (uint32_t i = 0; i < 4; i++) {
+	for (uint32_t i = 0; i < 16; i++) {
+		textures.RunGarbageCollector();
+	}
+	if (!VramBudgetTestAccess::IsImageRegistered(textures, id)) {
+		return "critical memory pressure evicted a texture unused for only 16 ticks";
+	}
+	for (uint32_t i = 16; i < 165; i++) {
 		textures.RunGarbageCollector();
 	}
 	if (VramBudgetTestAccess::IsImageRegistered(textures, id)) {
-		return "critical memory pressure did not evict a recent unused texture";
+		return "critical memory pressure did not evict an unused texture after 160 ticks";
 	}
 	return nullptr;
 }

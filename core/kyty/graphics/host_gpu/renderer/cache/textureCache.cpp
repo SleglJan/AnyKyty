@@ -4075,8 +4075,8 @@ void TextureCache::CollectAt(std::chrono::steady_clock::time_point now) {
 		bool     pressured  = m_total_used_memory >= m_pressure_gc_memory;
 		bool     aggressive = allow_aggressive && m_total_used_memory >= m_critical_gc_memory;
 		size_t   deletions  = aggressive ? 40 : pressured ? 20 : 10;
-		const auto cutoff = aggressive ? m_gc_history.Cutoff<2>(tick)
-		                  : pressured  ? m_gc_history.Cutoff<8>(tick)
+		const auto cutoff = aggressive ? m_gc_history.Cutoff<GcCriticalAge>(tick)
+		                  : pressured  ? m_gc_history.Cutoff<GcDownloadAge>(tick)
 		                               : m_gc_history.Cutoff<16>(tick);
 		if (!cutoff) {
 			return;

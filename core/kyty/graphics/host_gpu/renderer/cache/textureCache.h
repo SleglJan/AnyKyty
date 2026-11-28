@@ -519,7 +519,8 @@ private:
 	void             UpdateMemoryThresholds(uint64_t budget_bytes);
 	uint64_t         m_gc_tick                = 0;
 	static constexpr size_t GcDownloadAge = 80;
-	CacheGcHistory<GcDownloadAge> m_gc_history KYTY_GUARDED_BY(m_lock);
+	static constexpr size_t GcCriticalAge = 160;
+	CacheGcHistory<GcCriticalAge> m_gc_history KYTY_GUARDED_BY(m_lock);
 	void CollectAt(std::chrono::steady_clock::time_point now);
 	std::atomic<uint32_t> m_partial_candidates {0};
 	uint64_t         m_image_set_epoch        = 0;
