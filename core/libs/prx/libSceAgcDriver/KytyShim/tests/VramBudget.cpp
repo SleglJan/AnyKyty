@@ -211,9 +211,11 @@ const char* CheckGuestEviction(GraphicContext& graphics, TextureCache& textures,
 	return check_age(6 * GiB, 160);
 }
 
-const char* CheckBudgetLimitAndSpill(GraphicContext& graphics, bool expect_spill) {
+const char* CheckBudgetLimitAndSpill(GraphicContext& graphics, bool expect_spill, bool& skipped) {
+	skipped = false;
 	if (graphics.physical_device_properties.deviceType != vk::PhysicalDeviceType::eDiscreteGpu ||
 	    graphics.spill_allocator == nullptr) {
+		skipped = expect_spill;
 		return nullptr;
 	}
 	constexpr uint64_t LargeHeap = 4ull << 30u;
@@ -225,6 +227,7 @@ const char* CheckBudgetLimitAndSpill(GraphicContext& graphics, bool expect_spill
 		}
 	}
 	if (!has_large) {
+		skipped = expect_spill;
 		return nullptr;
 	}
 	constexpr uint64_t MiB = 1024ull * 1024;
@@ -316,9 +319,14 @@ extern "C" int RunKytyVramBudgetTest(int mode) {
 		return 1;
 	}
 	if (mode != 1) {
-		if (const auto* failure = CheckBudgetLimitAndSpill(gpu.graphics, mode == 2)) {
+		bool skipped = false;
+		if (const auto* failure = CheckBudgetLimitAndSpill(gpu.graphics, mode == 2, skipped)) {
 			std::fprintf(stderr, "%s: FAILED: %s\n", name, failure);
 			return 1;
+		}
+		if (skipped) {
+			std::fprintf(stderr, "%s: skipped, the device reports no supported spill path (requires a discrete GPU, spill allocator, and 4 GiB device-local heap)\n", name);
+			return 77;
 		}
 		if (mode == 2) {
 			std::printf("%s: ok\n", name);
