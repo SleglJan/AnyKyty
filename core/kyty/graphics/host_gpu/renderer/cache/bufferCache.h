@@ -296,6 +296,7 @@ private:
 	friend struct BufferCacheTestAccess;
 	friend struct BufferCacheGcTestAccess;
 	friend struct VramBudgetTestAccess;
+	friend struct VramTimeAgingTestAccess;
 	friend struct IndirectDispatchTestAccess;
 	friend struct BufferCacheBdaTestAccess;
 	friend class TextureCache;
@@ -329,7 +330,7 @@ private:
 	void ChangeRegister(BufferId id);
 	void DeleteBuffer(BufferId id);
 	void DiscardGpuWrites(uint64_t vaddr, uint64_t size);
-	void CollectStaleBuffers(uint64_t tick);
+	void CollectStaleBuffers(uint64_t tick, uint64_t frame_tick);
 	[[nodiscard]] bool NoImageStartsAt(uint64_t vaddr) const noexcept;
 	[[nodiscard]] bool SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t size,
 	                                     bool is_written, bool is_texel_buffer);
@@ -610,6 +611,9 @@ private:
 	uint64_t m_critical_gc_memory = 2ull * 1024 * 1024 * 1024;
 	uint64_t m_gc_tick            = 0;
 	void     UpdateMemoryThresholds(uint64_t budget_bytes);
+	uint64_t m_last_stale_tick    = 0;
+	std::chrono::steady_clock::time_point m_last_gc_time {std::chrono::steady_clock::now()};
+	[[nodiscard]] uint64_t                AdvanceGcTick();
 	void                                       NoteBufferRegions(const Buffer& buffer, bool insert);
 	void                                       GrowRegionTables(uint64_t region);
 	std::vector<uint32_t>                      m_region_buffer_count;

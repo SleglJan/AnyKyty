@@ -303,6 +303,14 @@ if(NOT ANYPS5_KYTY_DLL AND (WIN32 OR CMAKE_SYSTEM_NAME STREQUAL "Linux"))
     set_tests_properties(kyty_shim_stale_texture_binding PROPERTIES TIMEOUT 25 SKIP_RETURN_CODE 77
             ENVIRONMENT "KYTY_GPU_PIPELINE=0"
             PASS_REGULAR_EXPRESSION "kyty_shim_stale_texture_binding: ok" FAIL_REGULAR_EXPRESSION "FAILED")
+    target_sources(libSceAgcDriver PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/VramTimeAging.cpp)
+    add_test_executable(kyty_shim_vram_time_aging_tests ${CMAKE_CURRENT_SOURCE_DIR}/VramTimeAgingMain.cpp)
+    configure_host_test_executable(kyty_shim_vram_time_aging_tests)
+    target_link_libraries(kyty_shim_vram_time_aging_tests PRIVATE libSceAgcDriver libkernel libc)
+    add_test(NAME kyty_shim_vram_time_aging COMMAND kyty_shim_vram_time_aging_tests)
+    set_tests_properties(kyty_shim_vram_time_aging PROPERTIES TIMEOUT 25 SKIP_RETURN_CODE 77
+            ENVIRONMENT "KYTY_GPU_PIPELINE=0"
+            FAIL_REGULAR_EXPRESSION "FAILED")
     if(NOT ANYPS5_ENABLE_ASAN)
         if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
             target_sources(libSceAgcDriver PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/MaskedMaterialStore.cpp)
@@ -903,6 +911,17 @@ add_test(NAME kyty_shim_uniform_scalar_loads COMMAND kyty_shim_uniform_scalar_lo
 set_tests_properties(kyty_shim_uniform_scalar_loads PROPERTIES TIMEOUT 60
         PASS_REGULAR_EXPRESSION "kyty_shim_uniform_scalar_loads: ok" FAIL_REGULAR_EXPRESSION "terminate called|FAILED")
 
+add_test_executable(kyty_shim_submit_stats_tests ${CMAKE_CURRENT_SOURCE_DIR}/SubmitStats.cpp ${CMAKE_CURRENT_SOURCE_DIR}/../src/Log.cpp)
+target_include_directories(kyty_shim_submit_stats_tests PRIVATE ${LIBS_INCLUDE_DIR})
+configure_host_test_executable(kyty_shim_submit_stats_tests)
+if(MINGW)
+    target_link_libraries(kyty_shim_submit_stats_tests PRIVATE stdc++ gcc_eh)
+endif()
+target_link_libraries(kyty_shim_submit_stats_tests PRIVATE Kyty::gpu libkernel libc)
+add_test(NAME kyty_shim_submit_stats COMMAND kyty_shim_submit_stats_tests)
+set_tests_properties(kyty_shim_submit_stats PROPERTIES TIMEOUT 20
+        PASS_REGULAR_EXPRESSION "kyty_shim_submit_stats: ok" FAIL_REGULAR_EXPRESSION "terminate called|FAILED")
+
 add_test_executable(kyty_shim_ab_switches_tests ${CMAKE_CURRENT_SOURCE_DIR}/AbSwitches.cpp ${CMAKE_CURRENT_SOURCE_DIR}/../src/Log.cpp)
 target_include_directories(kyty_shim_ab_switches_tests PRIVATE ${LIBS_INCLUDE_DIR})
 configure_host_test_executable(kyty_shim_ab_switches_tests)
@@ -1097,4 +1116,16 @@ target_link_libraries(kyty_shim_descriptor_pool_oversize_tests PRIVATE
         Kyty::gpu libkernel libc)
 add_test(NAME kyty_shim_descriptor_pool_oversize COMMAND kyty_shim_descriptor_pool_oversize_tests)
 set_tests_properties(kyty_shim_descriptor_pool_oversize PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77)
+
+add_test_executable(kyty_shim_persistent_descriptor_reclaim_tests
+        ${CMAKE_CURRENT_SOURCE_DIR}/PersistentDescriptorReclaim.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/../src/Log.cpp)
+target_include_directories(kyty_shim_persistent_descriptor_reclaim_tests PRIVATE ${LIBS_INCLUDE_DIR})
+configure_host_test_executable(kyty_shim_persistent_descriptor_reclaim_tests)
+if(MINGW)
+    target_link_libraries(kyty_shim_persistent_descriptor_reclaim_tests PRIVATE stdc++ gcc_eh)
+endif()
+target_link_libraries(kyty_shim_persistent_descriptor_reclaim_tests PRIVATE Kyty::gpu libkernel libc)
+add_test(NAME kyty_shim_persistent_descriptor_reclaim COMMAND kyty_shim_persistent_descriptor_reclaim_tests)
+set_tests_properties(kyty_shim_persistent_descriptor_reclaim PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77)
 endif()

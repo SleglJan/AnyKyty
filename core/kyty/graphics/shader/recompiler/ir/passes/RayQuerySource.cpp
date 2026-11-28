@@ -1,6 +1,7 @@
 #include "graphics/shader/recompiler/ir/passes/RayQuerySource.h"
 
 #include "graphics/shader/recompiler/ir/RayQuery.h"
+#include "graphics/shader/recompiler/ir/RayQueryHeaderProgram.h"
 
 #include <algorithm>
 #include <array>
@@ -24,6 +25,8 @@ constexpr uint64_t Literal       = 1ull << 63;
 constexpr uint64_t Zext          = 0x10000;
 constexpr uint64_t Base48        = 0x10001;
 constexpr uint64_t DwordBase     = 0x10002;
+constexpr uint64_t BufferRecord  = 0x10003;
+constexpr uint64_t ScalarBuffer  = 0x10004;
 constexpr uint32_t None          = 0xffffffffu;
 constexpr uint32_t One           = 0xfffffffeu;
 
@@ -94,6 +97,17 @@ public:
 	uint32_t Of(uint32_t atom, uint32_t width) { return Make({width, 0, {{atom, 1}}}); }
 	uint32_t Op(uint32_t width, Key args) { return Of(Atomic(Kind::Op, width, std::move(args)), width); }
 
+	uint32_t Load(uint32_t address, uint32_t bytes, uint32_t checked_address = None) {
+		const uint32_t width = bytes * 8u;
+		return Of(Atomic(Kind::Load, width, {address, bytes, checked_address}), width);
+	}
+
+	uint32_t NextCheckedAddress(uint32_t address) {
+		if (address == None || address == One) return address;
+		const auto args = OpOf(address, ScalarBuffer)->args;
+		return Op(64, {ScalarBuffer, args[1], args[2], Add(static_cast<uint32_t>(args[3]), Constant(64, 4))});
+	}
+
 	uint32_t Add(uint32_t a, uint32_t b, uint64_t factor = 1) {
 		auto       form  = m_forms[a];
 		const auto other = m_forms[b];
@@ -160,7 +174,7 @@ public:
 			if (atom.width == 32) return Constant(32, 0);
 			if (atom.kind == Kind::Pointer) return Of(Atomic(Kind::Word, 32, {atom.args[0] + 1u}), 32);
 			if (atom.kind == Kind::Load) {
-				return Of(Atomic(Kind::Load, 32, {Add(static_cast<uint32_t>(atom.args[0]), Constant(64, 4)), 4}), 32);
+				return Load(Add(static_cast<uint32_t>(atom.args[0]), Constant(64, 4)), 4, NextCheckedAddress(static_cast<uint32_t>(atom.args[2])));
 			}
 			if (atom.kind == Kind::Join) return static_cast<uint32_t>(atom.args[1]);
 		}
@@ -179,7 +193,8 @@ public:
 			}
 			if (l.kind == Kind::Load && h.kind == Kind::Load && l.args[1] == 4 && h.args[1] == 4 &&
 			    h.args[0] == Add(static_cast<uint32_t>(l.args[0]), Constant(64, 4))) {
-				return Of(Atomic(Kind::Load, 64, {l.args[0], 8}), 64);
+				const auto checked = static_cast<uint32_t>(l.args[2]);
+				return Load(static_cast<uint32_t>(l.args[0]), 8, NextCheckedAddress(checked) == h.args[2] ? checked : One);
 			}
 			if (l.kind == Kind::Half && h.kind == Kind::Half && l.args[0] == h.args[0] && l.args[1] == 0 && h.args[1] == 1) {
 				return static_cast<uint32_t>(l.args[0]);
@@ -201,7 +216,7 @@ private:
 		if (atom.width == 32) return Of(id, 32);
 		switch (atom.kind) {
 			case Kind::Pointer: return Of(Atomic(Kind::Word, 32, {atom.args[0]}), 32);
-			case Kind::Load: return Of(Atomic(Kind::Load, 32, {atom.args[0], 4}), 32);
+			case Kind::Load: return Load(static_cast<uint32_t>(atom.args[0]), 4, static_cast<uint32_t>(atom.args[2]));
 			case Kind::Join: return static_cast<uint32_t>(atom.args[0]);
 			default: return Of(Atomic(Kind::Half, 32, {Of(id, 64), 0}), 32);
 		}
@@ -276,6 +291,154 @@ Value Incoming(const Inst& phi, const Block* from) {
 }
 
 using FForm = std::array<uint32_t, 7>;
+class EdgeReach {
+public:
+	explicit EdgeReach(const Program& program): m_program(program) {
+		for (const auto* block: program.blocks) {
+			if (block->ImmPredecessors().empty()) m_roots.push_back(block);
+		}
+	}
+
+	[[nodiscard]] bool Dead(const Block* block, const Block* from, const Block* target) const {
+		const auto key = std::tuple {block, from, target};
+		if (const auto at = m_dead.find(key); at != m_dead.end()) return at->second;
+		const bool dead = Decided(block, from, target);
+		m_dead.emplace(key, dead);
+		return dead;
+	}
+
+private:
+	using Known = std::vector<std::pair<Value, bool>>;
+
+	static bool Reaches(const Block* from, const Block* to, const Block* avoid) {
+		if (from == avoid) return false;
+		std::unordered_set<const Block*> seen {from};
+		std::vector<const Block*>        work {from};
+		while (!work.empty()) {
+			const auto* block = work.back();
+			work.pop_back();
+			if (block == to) return true;
+			for (const auto* next: block->ImmSuccessors()) {
+				if (next != avoid && seen.insert(next).second) work.push_back(next);
+			}
+		}
+		return false;
+	}
+
+	[[nodiscard]] bool Dominates(const Block* dominator, const Block* block) const {
+		if (dominator == block) return true;
+		if (m_roots.empty()) return false;
+		return std::ranges::none_of(m_roots, [&](const Block* root) { return Reaches(root, block, dominator); });
+	}
+
+	static void Learn(Known& known, Value value, bool truth, const Block* taken, const Block* branch, uint32_t depth = 0) {
+		value = value.Resolve();
+		if (value.IsImmediate() || depth > 8) return;
+		const auto* inst = value.TryInstruction();
+		if (inst == nullptr || inst->Parent() == nullptr || Reaches(taken, inst->Parent(), branch)) return;
+		known.emplace_back(value, truth);
+		switch (inst->GetOpcode()) {
+			case ValueOpcode::ConditionRef:
+				if (inst->Flags<CFG::BranchCondition>() == CFG::BranchCondition::ScalarInstruction) {
+					Learn(known, inst->Arg(0), truth, taken, branch, depth + 1);
+				}
+				break;
+			case ValueOpcode::LogicalNot: Learn(known, inst->Arg(0), !truth, taken, branch, depth + 1); break;
+			case ValueOpcode::LogicalAnd:
+				if (truth) {
+					Learn(known, inst->Arg(0), true, taken, branch, depth + 1);
+					Learn(known, inst->Arg(1), true, taken, branch, depth + 1);
+				}
+				break;
+			case ValueOpcode::LogicalOr:
+				if (!truth) {
+					Learn(known, inst->Arg(0), false, taken, branch, depth + 1);
+					Learn(known, inst->Arg(1), false, taken, branch, depth + 1);
+				}
+				break;
+			default: break;
+		}
+	}
+
+	const Known& KnownAt(const Block* from) const {
+		const auto at = m_known.find(from);
+		if (at != m_known.end()) return at->second;
+		Known known;
+		for (const auto* block: m_program.blocks) {
+			const auto& term = block->terminator;
+			if (block->condition.IsEmpty() || term.true_block == nullptr || term.false_block == nullptr ||
+			    term.true_block == term.false_block || !Dominates(block, from)) {
+				continue;
+			}
+			const bool taken = Reaches(term.true_block, from, block);
+			if (taken != Reaches(term.false_block, from, block)) {
+				Learn(known, block->condition, taken, taken ? term.true_block : term.false_block, block);
+			}
+		}
+		return m_known.emplace(from, std::move(known)).first->second;
+	}
+
+	static std::optional<bool> Evaluate(Value value, const Block* block, const Block* from, const Known& known, uint32_t depth) {
+		value = value.Resolve();
+		if (value.IsEmpty() || depth > 16) return std::nullopt;
+		if (value.IsImmediate()) return value.GetType() == Type::U1 ? std::optional(value.U1()) : std::nullopt;
+		const auto* inst = value.TryInstruction();
+		if (inst == nullptr) return std::nullopt;
+		if (inst->GetOpcode() == ValueOpcode::Phi && block != nullptr && inst->Parent() == block) {
+			for (size_t index = 0; index < inst->NumArgs(); ++index) {
+				if (inst->PhiBlock(index) == from) return Evaluate(inst->Arg(index), nullptr, from, known, depth + 1);
+			}
+			return std::nullopt;
+		}
+		for (const auto& [fact, truth]: known) {
+			if (fact == value) return truth;
+		}
+		switch (inst->GetOpcode()) {
+			case ValueOpcode::ConditionRef:
+				if (inst->Flags<CFG::BranchCondition>() == CFG::BranchCondition::ScalarInstruction) {
+					return Evaluate(inst->Arg(0), block, from, known, depth + 1);
+				}
+				return std::nullopt;
+			case ValueOpcode::LogicalNot: {
+				const auto inner = Evaluate(inst->Arg(0), block, from, known, depth + 1);
+				return inner ? std::optional(!*inner) : std::nullopt;
+			}
+			case ValueOpcode::LogicalAnd:
+			case ValueOpcode::LogicalOr: {
+				const bool any = inst->GetOpcode() == ValueOpcode::LogicalOr;
+				const auto a = Evaluate(inst->Arg(0), block, from, known, depth + 1);
+				const auto b = Evaluate(inst->Arg(1), block, from, known, depth + 1);
+				if (a == any || b == any) return any;
+				if (a && b) return !any;
+				return std::nullopt;
+			}
+			case ValueOpcode::SelectU1: {
+				const auto pick = Evaluate(inst->Arg(0), block, from, known, depth + 1);
+				return pick ? Evaluate(inst->Arg(*pick ? 1 : 2), block, from, known, depth + 1) : std::nullopt;
+			}
+			default: return std::nullopt;
+		}
+	}
+
+	[[nodiscard]] bool Decided(const Block* block, const Block* from, const Block* target) const {
+		const auto& term = block->terminator;
+		if (block == target || block->condition.IsEmpty() || term.true_block == nullptr || term.false_block == nullptr ||
+		    term.true_block == term.false_block) {
+			return false;
+		}
+		if (Reaches(block, from, nullptr)) return false;
+		const bool onward = Reaches(term.true_block, target, nullptr);
+		if (onward == Reaches(term.false_block, target, nullptr)) return false;
+		const auto taken = Evaluate(block->condition, block, from, KnownAt(from), 0);
+		return taken.has_value() && *taken != onward;
+	}
+
+	const Program&                                                           m_program;
+	std::vector<const Block*>                                                m_roots;
+	mutable std::map<std::tuple<const Block*, const Block*, const Block*>, bool> m_dead;
+	mutable std::unordered_map<const Block*, Known>                          m_known;
+};
+
 using World = std::array<std::vector<Value>, 6>;
 
 struct Blas {
@@ -290,6 +453,12 @@ public:
 	Evaluator(const Program& program, const Order& order, Store& store, Value active)
 	    : m_program(program), m_order(order), m_store(store) {
 		if (!active.IsEmpty()) AddFact(active);
+	}
+
+	Evaluator& Toward(const EdgeReach& reach, const Block* target) {
+		m_reach  = &reach;
+		m_target = target;
+		return *this;
 	}
 
 	std::optional<bool> Decide(Value condition, uint32_t depth = 0) const {
@@ -421,6 +590,7 @@ public:
 			if (!m_busy.insert(l).second) return {Opaque(*l, 64)};
 			Choices result;
 			for (size_t index = 0; index < l->NumArgs(); ++index) {
+				if (Unreached(*l, index, h)) continue;
 				const auto from = l->PhiBlock(index);
 				Append(result, Pair(l->Arg(index), Incoming(*h, from), depth + 1));
 			}
@@ -450,7 +620,7 @@ public:
 			}
 		}
 		Choices result;
-		for (const auto& lift: Lift(lo, 0, leaves)) {
+		for (const auto& lift: Lift(lo, 0, leaves, rest.size() == 1)) {
 			if (lift.adds.size() != carries.size() ||
 			    !std::ranges::all_of(carries, [&](const Inst* carry) { return std::ranges::find(lift.adds, carry) != lift.adds.end(); })) {
 				continue;
@@ -579,16 +749,21 @@ public:
 		return result;
 	}
 
-	Choices BufferAddress(const Inst& read) {
+	Choices ScalarBufferLoads(const Inst& read, uint32_t bytes) {
 		const auto& memory = m_program.memory_info[read.Flags<MemoryFlags>().index];
 		const auto* buffer = ProducerOf(read.Arg(0), ValueOpcode::GetBufferResource);
 		if (buffer == nullptr) return {};
+		const auto counts = Word(buffer->Arg(2));
 		Choices result;
 		for (const auto base: Pair(buffer->Arg(0), buffer->Arg(1))) {
 			const auto start = m_store.Op(64, {Base48, base});
 			for (const auto index: Word(read.Arg(1))) {
-				result.push_back(m_store.Add(m_store.Add(start, m_store.Widen(AlignDword(index))),
-				                             m_store.Constant(64, memory.offset & ~3u)));
+				const auto aligned = AlignDword(index);
+				const auto immediate = m_store.Constant(64, memory.offset & ~3u);
+				const auto offset = m_store.Add(m_store.Widen(aligned), immediate);
+				const auto exact_offset = m_store.Add(m_store.Op(64, {Zext, aligned}), immediate);
+				const auto checked = counts.size() == 1 ? m_store.Op(64, {ScalarBuffer, base, counts[0], exact_offset}) : One;
+				result.push_back(m_store.Load(m_store.Add(start, offset), bytes, checked));
 			}
 		}
 		Cap(result);
@@ -660,10 +835,30 @@ public:
 		return result;
 	}
 
+	Choices RuntimeBufferAddress(const Inst& load) {
+		const auto& memory = m_program.memory_info[load.Flags<MemoryFlags>().index];
+		const auto* buffer = ProducerOf(load.Arg(0), ValueOpcode::GetBufferResource);
+		if (buffer == nullptr || memory.typed || memory.formatted || memory.data_bits != 32u || memory.offen) return {};
+		if (const auto word3 = ImmediateU32(buffer->Arg(3)); word3 && (*word3 & (1u << 23u)) != 0u) return {};
+		if (ImmediateU32(load.Arg(3)) != 0u) return {};
+		const auto bases = Pair(buffer->Arg(0), buffer->Arg(1));
+		const auto sizes = Word(buffer->Arg(2));
+		const auto flags = Word(buffer->Arg(3));
+		const auto index = memory.idxen ? Word(load.Arg(1)) : Choices {m_store.Constant(32, 0)};
+		if (bases.size() != 1 || sizes.size() != 1 || flags.size() != 1 || index.size() != 1) return {};
+		return {m_store.Op(64, {BufferRecord, bases[0], sizes[0], flags[0], m_store.Widen(index[0]), m_store.Constant(64, memory.offset)})};
+	}
+
+	uint32_t RuntimeBufferWord(const Inst& load) {
+		const auto address = RuntimeBufferAddress(load);
+		if (address.empty()) return Opaque(load, 32);
+		return m_store.Of(m_store.Atomic(Kind::Opaque, 32, {address[0]}, &load), 32);
+	}
+
 	Choices LoadedBufferWord(const Inst& load, uint32_t component) {
 		Choices result;
 		for (const auto address: LoadedBufferAddress(load)) {
-			result.push_back(m_store.Of(m_store.Atomic(Kind::Load, 32, {m_store.Add(address, m_store.Constant(64, component * 4u)), 4}), 32));
+			result.push_back(m_store.Load(m_store.Add(address, m_store.Constant(64, component * 4u)), 4, One));
 		}
 		return result;
 	}
@@ -809,6 +1004,15 @@ private:
 		std::vector<const Inst*> products;
 	};
 
+	[[nodiscard]] bool Unreached(const Inst& phi, size_t index, const Inst* high = nullptr) const {
+		const auto* join = phi.Parent();
+		if (m_reach == nullptr || m_target == nullptr || !m_reach->Dead(join, phi.PhiBlock(index), m_target)) return false;
+		const auto used_at_join = [join](const Inst& part) {
+			return std::ranges::any_of(part.Uses(), [join](const Use& use) { return use.user->Parent() == join; });
+		};
+		return !used_at_join(phi) && (high == nullptr || !used_at_join(*high));
+	}
+
 	Evaluator& Given(Value fact) {
 		fact = fact.Resolve();
 		const auto* inst = fact.TryInstruction();
@@ -817,6 +1021,8 @@ private:
 		if (!child) {
 			child          = std::make_unique<Evaluator>(m_program, m_order, m_store, Value {});
 			child->m_facts = m_facts;
+			child->m_reach  = m_reach;
+			child->m_target = m_target;
 			child->AddFact(fact);
 		}
 		return *child;
@@ -842,6 +1048,8 @@ private:
 		if (!child) {
 			child          = std::make_unique<Evaluator>(m_program, m_order, m_store, Value {});
 			child->m_facts = m_facts;
+			child->m_reach  = m_reach;
+			child->m_target = m_target;
 			for (const auto fact: extra) child->AddFact(fact);
 		}
 		return child.get();
@@ -959,28 +1167,37 @@ private:
 		const auto* select = ProducerOf(value, ValueOpcode::SelectU32);
 		if (select == nullptr || ImmediateU32(select->Arg(1)) != 1u || ImmediateU32(select->Arg(2)) != 0u) return nullptr;
 		Value condition = select->Arg(0);
-		const auto compares = [](Value value) {
-			const auto* inst = value.Resolve().TryInstruction();
-			return inst != nullptr && (inst->GetOpcode() == ValueOpcode::ULessThan32 || inst->GetOpcode() == ValueOpcode::UGreaterThan32);
-		};
 		for (uint32_t depth = 0; depth < 4; ++depth) {
 			const auto* both = ProducerOf(condition, ValueOpcode::LogicalAnd);
 			if (both == nullptr) break;
-			const bool left  = Decide(both->Arg(0)) == true || (compares(both->Arg(1)) && !compares(both->Arg(0)));
-			const bool right = Decide(both->Arg(1)) == true || (compares(both->Arg(0)) && !compares(both->Arg(1)));
-			if (left == right) break;
-			condition = both->Arg(left ? 1 : 0);
+			if (Decide(both->Arg(0)) == true) condition = both->Arg(1);
+			else if (Decide(both->Arg(1)) == true) condition = both->Arg(0);
+			else return nullptr;
 		}
-		if (const auto* less = ProducerOf(condition, ValueOpcode::ULessThan32)) {
-			return less->Arg(0).Resolve().TryInstruction();
-		}
-		if (const auto* more = ProducerOf(condition, ValueOpcode::UGreaterThan32)) {
-			return more->Arg(1).Resolve().TryInstruction();
-		}
-		return nullptr;
+		const auto* compare = condition.Resolve().TryInstruction();
+		if (compare == nullptr) return nullptr;
+		const bool less = compare->GetOpcode() == ValueOpcode::ULessThan32;
+		if (!less && compare->GetOpcode() != ValueOpcode::UGreaterThan32) return nullptr;
+		const auto* sum = ProducerOf(compare->Arg(less ? 0 : 1), ValueOpcode::IAdd32);
+		const auto term = compare->Arg(less ? 1 : 0).Resolve();
+		return sum != nullptr && (sum->Arg(0).Resolve() == term || sum->Arg(1).Resolve() == term) ? sum : nullptr;
 	}
 
-	std::vector<LiftResult> Lift(Value lo, uint32_t depth, const std::vector<Value>& leaves) {
+	std::optional<uint32_t> JoinedPhi(const Inst& low, const Inst& high) {
+		std::optional<uint32_t> result;
+		for (size_t index = 0; index < low.NumArgs(); ++index) {
+			if (Unreached(low, index, &high)) continue;
+			const auto lower = Word(low.Arg(index));
+			const auto upper = Word(Incoming(high, low.PhiBlock(index)));
+			if (lower.size() != 1 || upper.size() != 1) return std::nullopt;
+			const auto wide = m_store.Join(lower.front(), upper.front());
+			if (result && *result != wide) return std::nullopt;
+			result = wide;
+		}
+		return result;
+	}
+
+	std::vector<LiftResult> Lift(Value lo, uint32_t depth, const std::vector<Value>& leaves, bool unique_high) {
 		lo = lo.Resolve();
 		std::vector<LiftResult> result;
 		const auto              zero = m_store.Constant(32, 0);
@@ -989,7 +1206,7 @@ private:
 		if (inst == nullptr || depth > 12) return {};
 		switch (inst->GetOpcode()) {
 			case ValueOpcode::IAdd32: {
-				const auto left = Lift(inst->Arg(0), depth + 1, leaves), right = Lift(inst->Arg(1), depth + 1, leaves);
+				const auto left = Lift(inst->Arg(0), depth + 1, leaves, unique_high), right = Lift(inst->Arg(1), depth + 1, leaves, unique_high);
 				for (size_t diagonal = 0; diagonal + 1 < left.size() + right.size(); ++diagonal) {
 					for (size_t i = 0; i <= diagonal && i < left.size(); ++i) {
 						if (diagonal - i >= right.size()) continue;
@@ -1032,14 +1249,13 @@ private:
 				}
 				break;
 			case ValueOpcode::ReadConstBuffer:
-				for (const auto address: BufferAddress(*inst)) {
-					const auto wide = m_store.Of(m_store.Atomic(Kind::Load, 64, {address, 8}), 64);
+				for (const auto wide: ScalarBufferLoads(*inst, 8)) {
 					result.push_back({wide, m_store.Hi(wide), {}});
 				}
 				break;
 			case ValueOpcode::LoadAddressU32:
 				for (const auto address: Address(*inst)) {
-					const auto wide = m_store.Of(m_store.Atomic(Kind::Load, 64, {address, 8}), 64);
+					const auto wide = m_store.Load(address, 8);
 					result.push_back({wide, m_store.Hi(wide), {}});
 				}
 				break;
@@ -1059,17 +1275,25 @@ private:
 				break;
 			case ValueOpcode::SelectU32: {
 				if (CarryOf(lo)) break;
-				if (const auto pick = Decide(inst->Arg(0))) return Lift(inst->Arg(*pick ? 1 : 2), depth + 1, leaves);
-				result = Lift(inst->Arg(1), depth + 1, leaves);
-				for (auto& other: Lift(inst->Arg(2), depth + 1, leaves)) result.push_back(std::move(other));
+				if (const auto pick = Decide(inst->Arg(0))) return Lift(inst->Arg(*pick ? 1 : 2), depth + 1, leaves, unique_high);
+				result = Lift(inst->Arg(1), depth + 1, leaves, unique_high);
+				for (auto& other: Lift(inst->Arg(2), depth + 1, leaves, unique_high)) result.push_back(std::move(other));
 				if (result.size() > MaxChoices) result.resize(MaxChoices);
 				return result;
 			}
 			case ValueOpcode::BitCastF32U32:
 			case ValueOpcode::BitCastU32F32:
-			case ValueOpcode::ReadFirstLane: return Lift(inst->Arg(0), depth + 1, leaves);
+			case ValueOpcode::ReadFirstLane: return Lift(inst->Arg(0), depth + 1, leaves, unique_high);
 			case ValueOpcode::Phi:
-				if (!m_order.Carried(*inst)) break;
+				if (!m_order.Carried(*inst)) {
+					if (!unique_high) break;
+					for (const auto leaf: leaves) {
+						const auto* high = ProducerOf(leaf, ValueOpcode::Phi);
+						if (high == nullptr || high == inst || high->Parent() != inst->Parent() || m_order.Carried(*high)) continue;
+						if (const auto wide = JoinedPhi(*inst, *high)) result.push_back({*wide, m_store.Hi(*wide), {}});
+					}
+					break;
+				}
 				for (const auto leaf: leaves) {
 					const auto* high = leaf.Resolve().TryInstruction();
 					if (high == nullptr || high == inst || !m_order.Carried(*high) || high->Parent() != inst->Parent()) continue;
@@ -1094,7 +1318,8 @@ private:
 					continue;
 				}
 				if (arg.GetType() == Type::U64) {
-					for (auto& key: keys) key.push_back(Literal | (arg.U64() & ~Literal));
+					const auto operand = (arg.U64() & Literal) != 0 ? m_store.Constant(64, arg.U64()) : Literal | arg.U64();
+					for (auto& key: keys) key.push_back(operand);
 					continue;
 				}
 				for (auto& key: keys) key.push_back(Literal);
@@ -1150,7 +1375,9 @@ private:
 			case ValueOpcode::Phi: {
 				if (m_order.Carried(inst)) return {Opaque(inst, 32)};
 				Choices result;
-				for (size_t index = 0; index < inst.NumArgs(); ++index) Append(result, Word(inst.Arg(index)));
+				for (size_t index = 0; index < inst.NumArgs(); ++index) {
+					if (!Unreached(inst, index)) Append(result, Word(inst.Arg(index)));
+				}
 				return result;
 			}
 			case ValueOpcode::IAdd32: return Combine(inst.Arg(0), inst.Arg(1), [&](uint32_t x, uint32_t y) { return m_store.Add(x, y); });
@@ -1181,17 +1408,16 @@ private:
 			}
 			case ValueOpcode::LoadAddressU32: {
 				Choices result;
-				for (const auto address: Address(inst)) result.push_back(m_store.Of(m_store.Atomic(Kind::Load, 32, {address, 4}), 32));
+				for (const auto address: Address(inst)) result.push_back(m_store.Load(address, 4));
 				return result.empty() ? Choices {Opaque(inst, 32)} : result;
 			}
 			case ValueOpcode::ReadConstBuffer: {
-				Choices result;
-				for (const auto address: BufferAddress(inst)) result.push_back(m_store.Of(m_store.Atomic(Kind::Load, 32, {address, 4}), 32));
+				auto result = ScalarBufferLoads(inst, 4);
 				return result.empty() ? Choices {Opaque(inst, 32)} : result;
 			}
 			case ValueOpcode::LoadBufferU32: {
 				auto result = LoadedBufferWord(inst, 0);
-				return result.empty() ? Choices {Opaque(inst, 32)} : result;
+				return result.empty() ? Choices {RuntimeBufferWord(inst)} : result;
 			}
 			case ValueOpcode::CompositeExtractU32x2:
 			case ValueOpcode::CompositeExtractU32x3:
@@ -1239,7 +1465,9 @@ private:
 			case ValueOpcode::Phi: {
 				if (m_order.Carried(inst)) return {Opaque(inst, 64)};
 				Choices result;
-				for (size_t index = 0; index < inst.NumArgs(); ++index) Append(result, Wide(inst.Arg(index)));
+				for (size_t index = 0; index < inst.NumArgs(); ++index) {
+					if (!Unreached(inst, index)) Append(result, Wide(inst.Arg(index)));
+				}
 				return result;
 			}
 			case ValueOpcode::BitwiseAnd64:
@@ -1258,12 +1486,15 @@ private:
 	std::unordered_map<const Inst*, std::vector<FForm>> m_floats;
 	std::unordered_map<const Inst*, std::unique_ptr<Evaluator>> m_given;
 	std::map<std::pair<const Block*, const Block*>, std::unique_ptr<Evaluator>> m_edges;
+	const EdgeReach*                                m_reach  = nullptr;
+	const Block*                                    m_target = nullptr;
 };
 
 struct Source {
-	uint32_t user_sgpr     = 0;
-	uint32_t header_offset = 0;
-	uint32_t header_vsharp = 0xffffffffu;
+	uint32_t              user_sgpr     = 0;
+	uint32_t              header_offset = 0;
+	uint32_t              header_vsharp = 0xffffffffu;
+	std::vector<uint32_t> program;
 
 	bool operator==(const Source&) const = default;
 };
@@ -1275,7 +1506,148 @@ const Atom* UserTablePointer(const Store& store, const Atom& base) {
 	return atom && store.A(*atom).kind == Kind::Pointer ? &store.A(*atom) : nullptr;
 }
 
-std::optional<Source> SourceOf(const Store& store, uint32_t form) {
+class HeaderProgramWriter {
+public:
+	explicit HeaderProgramWriter(const Store& store): m_store(store) {}
+
+	std::optional<std::vector<uint32_t>> Write(const IR::Atom& load) {
+		if (!Address(load, 0) || !ValidHeaderProgram(m_program, 16)) return std::nullopt;
+		return std::move(m_program);
+	}
+
+private:
+	void Emit(HeaderOp op, std::initializer_list<uint32_t> args = {}) {
+		m_program.push_back(static_cast<uint32_t>(op));
+		m_program.insert(m_program.end(), args);
+	}
+
+	void Constant(uint64_t value) { Emit(HeaderOp::Const, {static_cast<uint32_t>(value), static_cast<uint32_t>(value >> 32u)}); }
+
+	bool Form(uint32_t id, uint32_t depth) {
+		if (depth > 24 || m_program.size() > MaxRayQueryHeaderProgramSize) return false;
+		const auto& form  = m_store.F(id);
+		bool        first = true;
+		if (form.constant != 0 || form.terms.empty()) {
+			Constant(form.constant);
+			first = false;
+		}
+		for (const auto& [atom, scale]: form.terms) {
+			if (!Atom(atom, depth + 1)) return false;
+			if (scale != 1) Emit(HeaderOp::Mul, {static_cast<uint32_t>(scale), static_cast<uint32_t>(scale >> 32u)});
+			if (!first) Emit(HeaderOp::Add);
+			first = false;
+		}
+		if (form.width == 32) Emit(HeaderOp::Mask, {32});
+		return true;
+	}
+
+	bool Address(const IR::Atom& load, uint32_t depth) {
+		const auto checked = static_cast<uint32_t>(load.args[2]);
+		if (checked == None) return Form(static_cast<uint32_t>(load.args[0]), depth);
+		if (checked == One) return false;
+		const auto& args = m_store.OpOf(checked, ScalarBuffer)->args;
+		for (size_t i = 1; i < args.size(); ++i) {
+			if (!Form(static_cast<uint32_t>(args[i]), depth)) return false;
+		}
+		Emit(HeaderOp::ScalarBuffer, {static_cast<uint32_t>(load.args[1])});
+		return true;
+	}
+
+	bool Operand(uint64_t arg, uint32_t depth) {
+		if ((arg & Literal) != 0) {
+			Constant(arg & ~Literal);
+			return true;
+		}
+		return Form(static_cast<uint32_t>(arg), depth);
+	}
+
+	bool Atom(uint32_t id, uint32_t depth) {
+		const auto& a = m_store.A(id);
+		switch (a.kind) {
+			case Kind::Word: Emit(HeaderOp::User, {static_cast<uint32_t>(a.args[0])}); return true;
+			case Kind::Pointer:
+				Emit(HeaderOp::User, {static_cast<uint32_t>(a.args[0])});
+				Emit(HeaderOp::User, {static_cast<uint32_t>(a.args[0]) + 1u});
+				Emit(HeaderOp::Join);
+				return true;
+			case Kind::Load:
+				if (!Address(a, depth)) return false;
+				Emit(HeaderOp::Load, {static_cast<uint32_t>(a.args[1])});
+				return true;
+			case Kind::Half:
+				if (!Form(static_cast<uint32_t>(a.args[0]), depth)) return false;
+				if (a.args[1] == 0) {
+					Emit(HeaderOp::Mask, {32});
+				} else {
+					Emit(HeaderOp::Hi);
+				}
+				return true;
+			case Kind::Join:
+				if (!Form(static_cast<uint32_t>(a.args[0]), depth) || !Form(static_cast<uint32_t>(a.args[1]), depth)) return false;
+				Emit(HeaderOp::Join);
+				return true;
+			case Kind::Opaque:
+				if (a.width != 32 || a.args.size() != 1 || a.inst == nullptr || a.inst->GetOpcode() != ValueOpcode::LoadBufferU32) return false;
+				if (!Form(static_cast<uint32_t>(a.args[0]), depth)) return false;
+				Emit(HeaderOp::Load, {4});
+				return true;
+			case Kind::Op: return Op(a, depth);
+		}
+		return false;
+	}
+
+	bool Op(const IR::Atom& a, uint32_t depth) {
+		const auto opcode = a.args[0];
+		if (opcode == Zext && a.args.size() == 2) return Form(static_cast<uint32_t>(a.args[1]), depth);
+		if (opcode == DwordBase && a.args.size() == 2) {
+			if (!Form(static_cast<uint32_t>(a.args[1]), depth)) return false;
+			Constant(~uint64_t {3});
+			Emit(HeaderOp::And);
+			return true;
+		}
+		if (opcode == Base48 && a.args.size() == 2) {
+			if (!Form(static_cast<uint32_t>(a.args[1]), depth)) return false;
+			Emit(HeaderOp::Mask, {48});
+			return true;
+		}
+		if (opcode == BufferRecord && a.args.size() == 6) {
+			for (size_t index = 1; index < 6; ++index) {
+				if (!Form(static_cast<uint32_t>(a.args[index]), depth)) return false;
+			}
+			Emit(HeaderOp::Record);
+			return true;
+		}
+		struct Mapping {
+			ValueOpcode op;
+			HeaderOp    header;
+			uint32_t    arity;
+			uint32_t    width;
+		};
+		static constexpr std::array Mappings {
+		    Mapping {ValueOpcode::BitwiseAnd32, HeaderOp::And, 2, 0},       Mapping {ValueOpcode::BitwiseOr32, HeaderOp::Or, 2, 0},
+		    Mapping {ValueOpcode::BitwiseXor32, HeaderOp::Xor, 2, 0},       Mapping {ValueOpcode::UMin32, HeaderOp::UMin, 2, 0},
+		    Mapping {ValueOpcode::UMax32, HeaderOp::UMax, 2, 0},            Mapping {ValueOpcode::BitwiseAnd64, HeaderOp::And, 2, 0},
+		    Mapping {ValueOpcode::ShiftRightLogical32, HeaderOp::Shr, 2, 32}, Mapping {ValueOpcode::ShiftRightLogical64, HeaderOp::Shr, 2, 64},
+		    Mapping {ValueOpcode::ShiftLeftLogical64, HeaderOp::Shl, 2, 64},  Mapping {ValueOpcode::BitFieldUExtract, HeaderOp::Bfe, 3, 0},
+		};
+		const auto at = std::ranges::find_if(Mappings, [&](const Mapping& m) { return static_cast<uint64_t>(m.op) == opcode; });
+		if (at == Mappings.end() || a.args.size() != at->arity + 1u) return false;
+		for (size_t index = 1; index < a.args.size(); ++index) {
+			if (!Operand(a.args[index], depth)) return false;
+		}
+		if (at->width != 0) {
+			Emit(at->header, {at->width});
+		} else {
+			Emit(at->header);
+		}
+		return true;
+	}
+
+	const Store&          m_store;
+	std::vector<uint32_t> m_program;
+};
+
+std::optional<Source> NamedSourceOf(const Store& store, uint32_t form) {
 	const auto atom = store.AtomOf(form);
 	if (!atom) return std::nullopt;
 	const auto& a = store.A(*atom);
@@ -1303,6 +1675,16 @@ std::optional<Source> SourceOf(const Store& store, uint32_t form) {
 	if (pointer == nullptr) return std::nullopt;
 	const auto offset = static_cast<uint32_t>(table.constant);
 	return Source {static_cast<uint32_t>(pointer->args[0]), at, pointer == &user ? offset : ScalarRayQueryVsharpAt(offset)};
+}
+
+std::optional<Source> ProgramSourceOf(const Store& store, uint32_t form) {
+	const auto atom = store.AtomOf(form);
+	if (!atom) return std::nullopt;
+	const auto& a = store.A(*atom);
+	if (a.kind != Kind::Load || a.args[1] != 8) return std::nullopt;
+	auto program = HeaderProgramWriter(store).Write(a);
+	if (!program) return std::nullopt;
+	return Source {0, 0, RayQueryHeaderProgram, std::move(*program)};
 }
 
 struct Record {
@@ -1847,6 +2229,7 @@ OracleWalks Refuse(const char* reason, uint32_t detail = 0) {
 OracleWalks DeriveOracleWalks(const Program& program, std::span<Inst* const> intersections) {
 	if (intersections.empty()) return Refuse("no intersection");
 	const Order       order(program);
+	const EdgeReach   edges(program);
 	Store             store;
 	std::vector<Site> sites;
 	for (auto* bvh: intersections) {
@@ -1860,6 +2243,7 @@ OracleWalks DeriveOracleWalks(const Program& program, std::span<Inst* const> int
 	std::vector<std::tuple<Source, uint32_t, uint32_t>> named_sources;
 	for (auto& site: sites) {
 		Evaluator   ev(program, order, store, site.bvh->Arg(2));
+		ev.Toward(edges, site.bvh->Parent());
 		const auto* low   = ProducerOf(site.descriptor->Arg(0), ValueOpcode::CompositeExtractU64);
 		const auto* field = low != nullptr ? ProducerOf(low->Arg(0), ValueOpcode::BitwiseAnd64) : nullptr;
 		const auto* shift = field != nullptr ? ProducerOf(field->Arg(0), ValueOpcode::ShiftRightLogical64) : nullptr;
@@ -1884,7 +2268,7 @@ OracleWalks DeriveOracleWalks(const Program& program, std::span<Inst* const> int
 			}
 		}
 		for (const auto base: site.bases) {
-			if (const auto named = SourceOf(store, base)) {
+			if (const auto named = NamedSourceOf(store, base)) {
 				const auto at = std::ranges::find_if(named_sources, [&](const auto& entry) { return std::get<0>(entry) == *named; });
 				if (at == named_sources.end()) {
 					named_sources.emplace_back(*named, base, 1u);
@@ -1901,8 +2285,43 @@ OracleWalks DeriveOracleWalks(const Program& program, std::span<Inst* const> int
 			}
 		}
 	}
+	std::map<uint32_t, Source> computed;
+	for (auto& site: sites) {
+		if (site.top) continue;
+		Evaluator ev(program, order, store, site.bvh->Arg(2));
+		ev.Toward(edges, site.bvh->Parent());
+		for (const auto base: site.bases) {
+			const auto blas = BlasOf(store, base);
+			if (!blas) continue;
+			const auto unrolled = ev.Unroll(blas->address);
+			const bool record   = std::ranges::any_of(named_sources, [&](const auto& named) {
+				return std::ranges::any_of(unrolled, [&](uint32_t address) { return RecordOf(store, address, std::get<1>(named)).has_value(); });
+			});
+			if (record) continue;
+			auto source = ProgramSourceOf(store, base);
+			if (!source) continue;
+			std::erase_if(site.blases, [&](const Blas& entry) { return std::ranges::find(unrolled, entry.address) != unrolled.end(); });
+			const auto at = std::ranges::find_if(named_sources, [&](const auto& entry) { return std::get<0>(entry) == *source; });
+			if (at == named_sources.end()) {
+				named_sources.emplace_back(*source, base, 1u);
+			} else {
+				++std::get<2>(*at);
+			}
+			computed.emplace(base, std::move(*source));
+			site.top = true;
+		}
+	}
+	const auto source_of = [&](uint32_t base) -> std::optional<Source> {
+		if (auto named = NamedSourceOf(store, base)) return named;
+		const auto at = computed.find(base);
+		return at == computed.end() ? std::nullopt : std::optional<Source> {at->second};
+	};
 	if (named_sources.empty()) return Refuse("no intersection reads a structure named by the user data");
-	std::ranges::stable_sort(named_sources, [](const auto& a, const auto& b) { return std::get<2>(a) > std::get<2>(b); });
+	std::ranges::stable_sort(named_sources, [](const auto& a, const auto& b) {
+		const auto a_named = std::get<0>(a).program.empty(), b_named = std::get<0>(b).program.empty();
+		return a_named != b_named ? a_named : std::get<2>(a) > std::get<2>(b);
+	});
+	if (!std::get<0>(named_sources.front()).program.empty()) return Refuse("only computed headers name a structure");
 	const auto header = std::get<1>(named_sources.front());
 	std::optional<Record> indexed;
 	std::vector<uint32_t> keys;
@@ -1995,6 +2414,7 @@ OracleWalks DeriveOracleWalks(const Program& program, std::span<Inst* const> int
 	}
 	{
 		Evaluator ev(program, order, store, top->bvh->Arg(2));
+		ev.Toward(edges, top->bvh->Parent());
 		for (uint32_t k = 0; k < 6; ++k) {
 			const auto current = ev.Strip(top->address->Arg(top->words + 1 + k));
 			world[k].push_back(current);
@@ -2044,6 +2464,7 @@ OracleWalks DeriveOracleWalks(const Program& program, std::span<Inst* const> int
 		if (site.blases.empty()) continue;
 		lower.push_back(&site);
 		Evaluator ev(program, order, store, site.bvh->Arg(2));
+		ev.Toward(edges, site.bvh->Parent());
 		std::array<std::vector<FForm>, 6> rays;
 		for (uint32_t k = 0; k < 6; ++k) {
 			const auto arg   = site.address->Arg(site.words + 1 + k);
@@ -2113,6 +2534,7 @@ OracleWalks DeriveOracleWalks(const Program& program, std::span<Inst* const> int
 	std::vector<uint32_t>                      inline_roots;
 	for (const auto* site: lower) {
 		Evaluator ev(program, order, store, site->bvh->Arg(2));
+		ev.Toward(edges, site->bvh->Parent());
 		for (const auto& [value, distance]: NodeSources(ev, site->nodes)) {
 			if (value.IsImmediate()) continue;
 			for (const auto word: ev.Word(value)) {
@@ -2143,6 +2565,7 @@ OracleWalks DeriveOracleWalks(const Program& program, std::span<Inst* const> int
 	std::vector<uint32_t> tops;
 	{
 		Evaluator ev(program, order, store, top->bvh->Arg(2));
+		ev.Toward(edges, top->bvh->Parent());
 		for (const auto& [value, distance]: NodeSources(ev, top->nodes)) {
 			const auto constant = ImmediateU32(value);
 			if (!constant || *constant == 0xffffffffu || (*constant & 7u) < 4u || (*constant & 7u) > 5u) continue;
@@ -2325,7 +2748,7 @@ OracleWalks DeriveOracleWalks(const Program& program, std::span<Inst* const> int
 		if (!accepted[named]) continue;
 		const auto& source = std::get<0>(named_sources[named]);
 		listed[named]      = static_cast<uint32_t>(walks.headers.size());
-		walks.headers.push_back({source.user_sgpr, source.header_offset, source.header_vsharp, 0, {}});
+		walks.headers.push_back({source.user_sgpr, source.header_offset, source.header_vsharp, 0, {}, source.program});
 	}
 	for (const auto& site: sites) {
 		if (!site.top) continue;
@@ -2341,7 +2764,7 @@ OracleWalks DeriveOracleWalks(const Program& program, std::span<Inst* const> int
 			at = walks.loops.size() - 1;
 		}
 		for (const auto base: site.bases) {
-			const auto named = SourceOf(store, base);
+			const auto named = source_of(base);
 			if (!named) continue;
 			const auto found = std::ranges::find_if(named_sources, [&](const auto& entry) { return std::get<0>(entry) == *named; });
 			const auto index = listed[static_cast<size_t>(found - named_sources.begin())];
@@ -2357,7 +2780,7 @@ OracleWalks DeriveOracleWalks(const Program& program, std::span<Inst* const> int
 	}
 	std::vector<std::array<size_t, 5>> picks;
 	for (size_t source = 0; source < named_sources.size(); ++source) {
-		if (!accepted[source]) continue;
+		if (!accepted[source] || !std::get<0>(named_sources[source]).program.empty()) continue;
 		for (size_t count = 0; count < node_counts.size(); ++count) {
 			for (size_t tlas_root = 0; tlas_root < tops.size(); ++tlas_root) {
 				for (size_t root = 0; root < candidates.size() && picks.size() < 4096; ++root) {

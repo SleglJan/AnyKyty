@@ -112,6 +112,7 @@ public:
 	void               PrepareBda(bool may_write, bool full_sync = true);
 	void               PrepareHackMarks();
 	void               RunGarbageCollector();
+	[[nodiscard]] uint64_t RayQueryUserPointer(const RayTracing::TlasSource& source, std::span<const uint32_t> user);
 	void NoteHleTlas(uint64_t header, uint64_t size, std::vector<uint64_t> blases);
 	void ForgetHleTlas(uint64_t header);
 	void NoteGuestBvhMemory(uint64_t address, uint64_t size);
@@ -121,6 +122,7 @@ public:
 	void TriggerInterrupt(int event_id, uint32_t context_id);
 
 private:
+	[[nodiscard]] bool RayQueryMemoryReadable(uint64_t address, uint64_t size);
 	void CacheTlasMemory(const ShaderStageRuntime& runtime);
 	void CacheTlasMemory(const ShaderStageRuntime& runtime, const RayTracing::TlasSource& source, bool note_instances);
 	[[nodiscard]] bool SynchronizeDmaReach(std::span<const ShaderStageRuntime* const> stages);
