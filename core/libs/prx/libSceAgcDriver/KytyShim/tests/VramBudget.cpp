@@ -308,16 +308,17 @@ extern "C" int RunKytyVramBudgetTest(int mode) {
 	Config::Initialize();
 	Config::Load(Config::ConfigOptions {});
 	KytyShimTests::TestVulkanDevice gpu;
+	const bool required = std::getenv("ANYPS5_REQUIRE_VULKAN") != nullptr;
 	if (const auto* unavailable = gpu.Initialize()) {
-		const bool required = std::getenv("ANYPS5_REQUIRE_VULKAN") != nullptr;
 		std::fprintf(stderr, "%s: %s, no usable Vulkan device (%s)\n",
 		             name, required ? "FAILED" : "skipped", unavailable);
 		return required ? 1 : 77;
 	}
 	if (!gpu.graphics.CreateAllocator()) {
 		if (mode == 2) {
-			std::fprintf(stderr, "%s: skipped, could not create the spill-test allocator\n", name);
-			return 77;
+			std::fprintf(stderr, "%s: %s, could not create the spill-test allocator\n",
+			             name, required ? "FAILED" : "skipped");
+			return required ? 1 : 77;
 		}
 		std::fprintf(stderr, "%s: FAILED: could not create the allocator\n", name);
 		return 1;
