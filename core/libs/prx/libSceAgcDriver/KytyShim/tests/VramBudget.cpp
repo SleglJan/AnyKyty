@@ -4,6 +4,7 @@
 #include "graphics/guest_gpu/command_processor/commandProcessor.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
+#include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "kernel/memory.h"
@@ -117,6 +118,7 @@ const char* CheckVramBudget(GraphicContext& graphics, TextureCache& textures, Bu
 	if (const auto* failure = CheckDescriptorPoolRetirement(graphics)) {
 		return failure;
 	}
+	graphics.AdvanceFrame(1);
 	const auto tex_trigger_large  = VramBudgetTestAccess::TextureTrigger(textures);
 	const auto tex_pressure_large = VramBudgetTestAccess::TexturePressure(textures);
 	const auto tex_critical_large = VramBudgetTestAccess::TextureCritical(textures);
@@ -209,6 +211,72 @@ const char* CheckGuestEviction(GraphicContext& graphics, TextureCache& textures,
 	return check_age(6 * GiB, 160);
 }
 
+const char* CheckBudgetLimitAndSpill(GraphicContext& graphics, bool expect_spill) {
+	if (graphics.physical_device_properties.deviceType != vk::PhysicalDeviceType::eDiscreteGpu ||
+	    graphics.spill_allocator == nullptr) {
+		return nullptr;
+	}
+	constexpr uint64_t LargeHeap = 4ull << 30u;
+	bool               has_large = false;
+	for (uint32_t heap = 0; heap < graphics.physical_device_memory_properties.memoryHeapCount; ++heap) {
+		const auto& info = graphics.physical_device_memory_properties.memoryHeaps[heap];
+		if ((info.flags & vk::MemoryHeapFlagBits::eDeviceLocal) && info.size >= LargeHeap) {
+			has_large = true;
+		}
+	}
+	if (!has_large) {
+		return nullptr;
+	}
+	constexpr uint64_t MiB = 1024ull * 1024;
+	if (!expect_spill) {
+		std::array<GraphicContext::HeapUsage, VK_MAX_MEMORY_HEAPS> heaps {};
+		const auto count = graphics.GetHeapUsage(heaps);
+		uint64_t   cap   = 0;
+		for (uint32_t heap = 0; heap < count; ++heap) {
+			if (heaps[heap].device_local) {
+				const uint64_t size = graphics.physical_device_memory_properties.memoryHeaps[heap].size;
+				const uint64_t reserve = size >= LargeHeap ? std::min<uint64_t>(3072ull << 20u, size / 4) : 0;
+				cap += std::min<uint64_t>(heaps[heap].budget, size - reserve);
+			}
+		}
+		if (cap != 0 && graphics.GetTotalMemoryBudget() < cap) {
+			return "GetTotalMemoryBudget subtracted the eighth reserve on top of the heap limit";
+		}
+		return nullptr;
+	}
+	if (graphics.GetTotalMemoryBudget() > MiB) {
+		return "KYTY_MEMORY_BUDGET_MB=1 did not cap GetTotalMemoryBudget to 1 MiB";
+	}
+	std::array<GraphicContext::HeapUsage, VK_MAX_MEMORY_HEAPS> before {};
+	const auto count = graphics.GetHeapUsage(before);
+	uint32_t   before_host_allocs = 0;
+	for (uint32_t heap = 0; heap < count; ++heap) {
+		if (!before[heap].device_local) {
+			before_host_allocs += before[heap].allocations;
+		}
+	}
+	{
+		RenderContext renderer(graphics);
+		Buffer        spilled(graphics, renderer.GetCommandScheduler(), MemoryUsage::DeviceLocal, 0, AllFlags,
+		                      2 * MiB);
+		if (spilled.IsDeviceLocal()) {
+			return "2 MiB DeviceLocal buffer did not spill past the 1 MiB heap cap";
+		}
+		std::array<GraphicContext::HeapUsage, VK_MAX_MEMORY_HEAPS> after {};
+		const auto after_count = graphics.GetHeapUsage(after);
+		uint32_t after_host_allocs = 0;
+		for (uint32_t heap = 0; heap < after_count; ++heap) {
+			if (!after[heap].device_local) {
+				after_host_allocs += after[heap].allocations;
+			}
+		}
+		if (after_host_allocs <= before_host_allocs) {
+			return "GetHeapUsage did not include spilled host-heap allocation";
+		}
+	}
+	return nullptr;
+}
+
 const char* CheckVramCase(GraphicContext& graphics, uint64_t address) {
 	VramBudgetTestAccess::SetReportedMemory(graphics, (address == 0 ? 16 : 6) * GiB, 0);
 
@@ -229,8 +297,10 @@ const char* CheckVramCase(GraphicContext& graphics, uint64_t address) {
 
 }
 
-extern "C" int RunKytyVramBudgetTest(bool guest_eviction) {
-	const char* name = guest_eviction ? "kyty_shim_vram_budget_guest_eviction" : "kyty_shim_vram_budget";
+extern "C" int RunKytyVramBudgetTest(int mode) {
+	const char* name = mode == 1 ? "kyty_shim_vram_budget_guest_eviction"
+	                 : mode == 2 ? "kyty_shim_vram_budget_spill"
+	                             : "kyty_shim_vram_budget";
 	Common::InitializeThreads();
 	Config::Initialize();
 	Config::Load(Config::ConfigOptions {});
@@ -245,9 +315,19 @@ extern "C" int RunKytyVramBudgetTest(bool guest_eviction) {
 		std::fprintf(stderr, "%s: FAILED: could not create the allocator\n", name);
 		return 1;
 	}
+	if (mode != 1) {
+		if (const auto* failure = CheckBudgetLimitAndSpill(gpu.graphics, mode == 2)) {
+			std::fprintf(stderr, "%s: FAILED: %s\n", name, failure);
+			return 1;
+		}
+		if (mode == 2) {
+			std::printf("%s: ok\n", name);
+			return 0;
+		}
+	}
 
 	uint64_t address = 0;
-	if (guest_eviction) {
+	if (mode == 1) {
 		void* guest = nullptr;
 		if (sceKernelMapFlexibleMemory(&guest, GuestBytes, CpuReadWrite, 0) != 0 || guest == nullptr) {
 			std::fprintf(stderr, "%s: FAILED: could not map guest backing\n", name);
@@ -255,9 +335,9 @@ extern "C" int RunKytyVramBudgetTest(bool guest_eviction) {
 		}
 		address = reinterpret_cast<uint64_t>(guest);
 	}
-	const bool invalid_range = guest_eviction && !GuestRange {address, GuestBytes}.Valid();
+	const bool invalid_range = mode == 1 && !GuestRange {address, GuestBytes}.Valid();
 	const char* failure = invalid_range ? nullptr : CheckVramCase(gpu.graphics, address);
-	if (guest_eviction && sceKernelMunmap(address, GuestBytes) != 0) {
+	if (mode == 1 && sceKernelMunmap(address, GuestBytes) != 0) {
 		std::fprintf(stderr, "%s: FAILED: could not unmap guest backing\n", name);
 		return 1;
 	}
