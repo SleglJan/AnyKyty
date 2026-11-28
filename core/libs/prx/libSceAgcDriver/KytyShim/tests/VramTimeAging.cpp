@@ -28,27 +28,23 @@ struct VramTimeAgingTestAccess {
 		return image != nullptr && image->registered;
 	}
 
-	static void RewindTextureClock(TextureCache& cache, std::chrono::milliseconds delta) {
-		Common::ScopedLock lock {cache.m_lock};
-		cache.m_trigger_gc_memory  = 0;
-		cache.m_pressure_gc_memory = UINT64_MAX;
-		cache.m_critical_gc_memory = UINT64_MAX;
-		cache.m_last_gc_time       = std::chrono::steady_clock::now() - delta;
+	using Clock = std::chrono::steady_clock;
+
+	static void SetMemoryUsage(GraphicContext& graphics, uint64_t usage) {
+		graphics.m_memory_override_enabled = true;
+		graphics.m_memory_budget_override = 6ull << 30;
+		graphics.m_memory_usage_override = usage;
 	}
 
-	static uint64_t TextureTick(TextureCache& cache) {
-		Common::ScopedLock lock {cache.m_lock};
-		return cache.m_gc_tick;
+	static void Collect(TextureCache& textures, BufferCache& buffers, Clock::time_point now) {
+		textures.CollectAt(now);
+		buffers.CollectAt(now);
 	}
 
-	static void RewindBufferClock(BufferCache& cache, std::chrono::milliseconds delta,
-	                              bool trigger_gc) {
-		cache.m_trigger_gc_memory  = trigger_gc ? 0 : UINT64_MAX;
-		cache.m_critical_gc_memory = UINT64_MAX;
-		cache.m_last_gc_time       = std::chrono::steady_clock::now() - delta;
+	static void Touch(TextureCache& textures, ImageId id) {
+		Common::ScopedLock lock {textures.m_lock};
+		(void)textures.GetImage(id);
 	}
-
-	static uint64_t BufferTick(const BufferCache& cache) { return cache.m_gc_tick; }
 };
 
 }
@@ -61,103 +57,73 @@ constexpr uint64_t Page         = TRACKER_PAGE_SIZE;
 constexpr uint64_t GuestBytes   = 0x50000;
 constexpr int      CpuReadWrite = 0x03;
 
-const char* CheckTextureWallTimeAging(TextureCache& textures, uint64_t address) {
-	ImageId stale_id {};
-	ImageId active_id {};
-	if (address != 0) {
-		ImageInfo info;
-		info.data.address = address;
-		info.pixel_format = vk::Format::eR8G8B8A8Unorm;
-		info.guest_format = Prospero::BufferFormat::k8_8_8_8UNorm;
-		info.extent       = vk::Extent3D {64, 64, 1};
-		info.pitch        = 64;
-		info.UpdateSize();
-
-		stale_id = VramTimeAgingTestAccess::CreateImage(textures, info);
-		if (!VramTimeAgingTestAccess::IsImageRegistered(textures, stale_id)) {
-			return "test image was not registered";
+const char* CheckEviction(GraphicContext& graphics, TextureCache& textures, BufferCache& buffers, uint64_t address) {
+	using namespace std::chrono_literals;
+	using Access = VramTimeAgingTestAccess;
+	ImageInfo info;
+	info.data.address = address;
+	info.pixel_format = vk::Format::eR8G8B8A8Unorm;
+	info.guest_format = Prospero::BufferFormat::k8_8_8_8UNorm;
+	info.extent       = vk::Extent3D {64, 64, 1};
+	info.pitch        = 64;
+	info.UpdateSize();
+	const auto cold_image = Access::CreateImage(textures, info);
+	info.data.address += 0x4000;
+	const auto warm_image = Access::CreateImage(textures, info);
+	const auto cold = address + 0x10000;
+	const auto warm = address + 0x20000;
+	const auto pinned = address + 0x30000;
+	const auto dirty = address + 0x40000;
+	(void)buffers.FindBuffer(cold, Page);
+	const auto warm_id = buffers.FindBuffer(warm, Page);
+	buffers.CacheFaultedMemory(pinned, Page);
+	(void)buffers.ObtainBuffer(dirty, Page, true);
+	if (!Access::IsImageRegistered(textures, cold_image) || !buffers.RegisteredBuffer(cold, Page) ||
+	    !Access::IsImageRegistered(textures, warm_image) || !warm_id) {
+		return "test resources were not registered";
+	}
+	auto now = Access::Clock::time_point {};
+	for (unsigned pass = 0; pass < 12; ++pass) {
+		if (pass % 3 == 0) {
+			Access::Touch(textures, warm_image);
+			if (buffers.FindBuffer(warm, Page) != warm_id) {
+				return "buffer lookup replaced a reused buffer";
+			}
 		}
-		VramTimeAgingTestAccess::RewindTextureClock(textures, std::chrono::milliseconds(16));
-		textures.RunGarbageCollector();
-
-		info.data.address = address + 0x8000;
-		active_id         = VramTimeAgingTestAccess::CreateImage(textures, info);
-		if (!VramTimeAgingTestAccess::IsImageRegistered(textures, active_id)) {
-			return "active test image was not registered";
-		}
-	}
-	VramTimeAgingTestAccess::RewindTextureClock(textures, std::chrono::milliseconds(500));
-	textures.RunGarbageCollector();
-	if (VramTimeAgingTestAccess::TextureTick(textures) < 30) {
-		return "texture cache GC tick did not advance with elapsed wall time";
-	}
-	if (address != 0 && VramTimeAgingTestAccess::IsImageRegistered(textures, stale_id)) {
-		return "texture cache did not evict an unused image after 500 ms wall time";
-	}
-	if (address != 0 && !VramTimeAgingTestAccess::IsImageRegistered(textures, active_id)) {
-		return "texture cache evicted an image touched in the current frame across a 500 ms jump";
-	}
-	return nullptr;
-}
-
-const char* CheckBufferWallTimeAging(BufferCache& buffers, uint64_t address) {
-	const auto buf_addr        = address != 0 ? address + 0x10000 : 0;
-	const auto active_buf_addr = address != 0 ? address + 0x30000 : 0;
-	if (buf_addr != 0) {
-		(void)buffers.FindBuffer(buf_addr, Page);
-		if (!buffers.RegisteredBuffer(buf_addr, Page)) {
-			return "test buffer was not registered";
-		}
-		VramTimeAgingTestAccess::RewindBufferClock(buffers, std::chrono::milliseconds(16), false);
-		buffers.RunGarbageCollector();
-		(void)buffers.FindBuffer(active_buf_addr, Page);
-		if (!buffers.RegisteredBuffer(active_buf_addr, Page)) {
-			return "active test buffer was not registered";
+		now += 2857ms;
+		Access::Collect(textures, buffers, now);
+		if (!Access::IsImageRegistered(textures, warm_image) || buffers.RegisteredBuffer(warm, Page) != warm_id) {
+			return "GC evicted a resource used by alternating slow frames";
 		}
 	}
-	VramTimeAgingTestAccess::RewindBufferClock(buffers, std::chrono::milliseconds(3000), true);
-	buffers.RunGarbageCollector();
-	if (VramTimeAgingTestAccess::BufferTick(buffers) < 180) {
-		return "buffer cache GC tick did not advance with elapsed wall time";
+	if (Access::IsImageRegistered(textures, cold_image) || buffers.RegisteredBuffer(cold, Page)) {
+		return "slow frames did not retire the unused image and buffer under pressure";
 	}
-	if (buf_addr != 0 && buffers.RegisteredBuffer(buf_addr, Page)) {
-		return "buffer cache did not evict an unused buffer after 3000 ms wall time";
-	}
-	if (active_buf_addr != 0 && !buffers.RegisteredBuffer(active_buf_addr, Page)) {
-		return "buffer cache evicted a buffer touched in the current frame across a 3000 ms jump";
+	if (!buffers.RegisteredBuffer(pinned, Page)) {
+		return "GC evicted a device-address buffer before its use scan";
 	}
 
-	const auto stale_addr        = address != 0 ? address + 0x20000 : 0;
-	const auto active_stale_addr = address != 0 ? address + 0x40000 : 0;
-	if (stale_addr != 0) {
-		(void)buffers.FindBuffer(stale_addr, Page);
-		if (!buffers.RegisteredBuffer(stale_addr, Page)) {
-			return "stale test buffer was not registered";
-		}
-		VramTimeAgingTestAccess::RewindBufferClock(buffers, std::chrono::milliseconds(16), false);
-		buffers.RunGarbageCollector();
-		(void)buffers.FindBuffer(active_stale_addr, Page);
-		if (!buffers.RegisteredBuffer(active_stale_addr, Page)) {
-			return "active stale test buffer was not registered";
-		}
+	Access::SetMemoryUsage(graphics, 0);
+	(void)buffers.FindBuffer(cold, Page);
+	for (unsigned pass = 0; pass < 4; ++pass) {
+		now += 35005ms;
+		(void)buffers.FindBuffer(warm, Page);
+		Access::Collect(textures, buffers, now);
 	}
-	const auto before_stale_tick = VramTimeAgingTestAccess::BufferTick(buffers);
-	VramTimeAgingTestAccess::RewindBufferClock(buffers, std::chrono::milliseconds(35005), false);
-	buffers.RunGarbageCollector();
-	if (VramTimeAgingTestAccess::BufferTick(buffers) < before_stale_tick + 2100) {
-		return "buffer cache GC tick did not advance across stale wall-time jump";
+	if (buffers.RegisteredBuffer(cold, Page) || buffers.RegisteredBuffer(warm, Page) != warm_id ||
+	    !buffers.RegisteredBuffer(pinned, Page)) {
+		return "stale collection failed to retire only the unused unpinned buffer";
 	}
-	if (stale_addr != 0 && buffers.RegisteredBuffer(stale_addr, Page)) {
-		return "buffer cache stale collection skipped an unaligned wall-time tick jump";
-	}
-	if (active_stale_addr != 0 && !buffers.RegisteredBuffer(active_stale_addr, Page)) {
-		return "buffer cache stale collection retired a buffer touched in the current frame";
+	if (!buffers.RegisteredBuffer(dirty, Page) || !buffers.IsRegionGpuModified(dirty, Page)) {
+		return "GC lost a GPU-written buffer below critical pressure";
 	}
 	return nullptr;
 }
 
 const char* CheckTimeAging(GraphicContext& graphics, uint64_t address) {
-	RenderContext    renderer(graphics);
+	VramTimeAgingTestAccess::SetMemoryUsage(graphics, 3ull << 30);
+	RenderContext renderer(graphics);
+	renderer.InitializeGpu(nullptr);
 	CommandProcessor producer(renderer, 0);
 	producer.Reset();
 	auto& scheduler = renderer.GetCommandScheduler();
@@ -165,16 +131,11 @@ const char* CheckTimeAging(GraphicContext& graphics, uint64_t address) {
 	auto& buffers   = renderer.GetBufferCache();
 	scheduler.Begin(producer.GetCtx(), producer.GetUcfg(), producer.GetShCtx());
 
-	const char* failure = CheckTextureWallTimeAging(textures, address);
-	if (failure == nullptr) {
-		failure = CheckBufferWallTimeAging(buffers, address);
-	}
+	const char* failure = CheckEviction(graphics, textures, buffers, address);
 	const auto last = scheduler.CurrentTick();
 	scheduler.Wait(last);
 	scheduler.WaitPriorityOperations(last);
-	if (address != 0) {
-		(void)buffers.DropFreedRange(address, GuestBytes, nullptr, nullptr);
-	}
+	(void)buffers.DropFreedRange(address, GuestBytes, nullptr, nullptr);
 	return failure;
 }
 
@@ -202,13 +163,14 @@ extern "C" int RunKytyVramTimeAgingTest() {
 	}
 	const auto address     = reinterpret_cast<uint64_t>(guest);
 	const bool valid_guest = GuestRange {address, GuestBytes}.Valid();
-	if (!valid_guest && std::getenv("ANYPS5_REQUIRE_VULKAN") != nullptr) {
+	if (!valid_guest) {
+		const bool required = std::getenv("ANYPS5_REQUIRE_VULKAN") != nullptr;
 		(void)sceKernelMunmap(address, GuestBytes);
-		std::fprintf(stderr, "kyty_shim_vram_time_aging: FAILED: guest range 0x%llx is outside Kyty bounds\n",
-		             static_cast<unsigned long long>(address));
-		return 1;
+		std::fprintf(stderr, "kyty_shim_vram_time_aging: %s: guest range 0x%llx is outside Kyty bounds\n",
+		             required ? "FAILED" : "skipped", static_cast<unsigned long long>(address));
+		return required ? 1 : 77;
 	}
-	const char* failure = CheckTimeAging(gpu.graphics, valid_guest ? address : 0);
+	const char* failure = CheckTimeAging(gpu.graphics, address);
 	if (sceKernelMunmap(address, GuestBytes) != 0) {
 		std::fputs("kyty_shim_vram_time_aging: FAILED: could not unmap guest backing\n", stderr);
 		return 1;
