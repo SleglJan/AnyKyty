@@ -983,10 +983,10 @@ RenderExecutor::MakeTextureDescKey(const ShaderRecompiler::IR::ImageResource&   
 bool RenderExecutor::ReuseTextureLookup(TextureDescDerivation& derived, TextureBinding& binding) {
 	auto&       texture_cache = m_context.GetTextureCache();
 	auto&       found         = derived.found;
-	auto*       image         = texture_cache.m_slot_images.try_get(found.id);
+	auto*       image         = found.image.Get(texture_cache.m_slot_images);
 	const auto& range         = found.desc.info.data;
 	if (image == nullptr || !image->registered || image->binding.needs_rebind ||
-	    ImageLookupState::Of(found.id, *image) != found.state) {
+	    ImageLookupState::Of(found.image.id, *image) != found.state) {
 		found.valid = false;
 		return false;
 	}
@@ -999,10 +999,11 @@ bool RenderExecutor::ReuseTextureLookup(TextureDescDerivation& derived, TextureB
 	}
 	image->tick_accessed_last = texture_cache.m_gc_tick;
 	texture_cache.TouchImage(*image);
-	binding.image_id   = found.id;
-	binding.image_view = found.view;
-	binding.desc       = found.desc;
-	binding.layout     = vk::ImageLayout::eUndefined;
+	binding.image_id     = found.image.id;
+	binding.image_serial = found.image.serial;
+	binding.image_view   = found.view;
+	binding.desc         = found.desc;
+	binding.layout       = vk::ImageLayout::eUndefined;
 	binding.mip_views.clear();
 	binding.lookup = &derived;
 	binding.reused = true;
@@ -1201,6 +1202,7 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 		                             descriptor.DstSelXYZW());
 	}
 	TextureBinding binding {id, nullptr, std::move(desc)};
+	binding.image_serial = texture_cache.GetImage(id).serial;
 	if (reusable && !stencil_association && !image->info.HasStencil()) {
 		binding.lookup = &derived;
 	}
@@ -1213,7 +1215,6 @@ TextureBinding RenderExecutor::ResolveTableTexture(
 	if (ShaderRecompiler::IR::ImageTableSlotCompatible(root, value)) {
 		auto texture = ResolveTexture(root, value, true, examined);
 		if (texture.image_id) {
-			texture.table_serial = m_context.GetTextureCache().GetImage(texture.image_id).serial;
 			return texture;
 		}
 	}
@@ -2059,7 +2060,8 @@ void RenderExecutor::RebindReusedTables(PreparedBindings& prepared) {
 		       (!image->is_depth_copy || texture_cache.DepthCopyCurrent(*image)) && TableImageReady(*image, texture);
 	};
 	const auto bound_stamp = ++m_bound_image_stamp;
-	for (const auto id: m_bound_images) {
+	for (const auto ref: m_bound_images) {
+		const auto id = ref.id;
 		if (!id) {
 			continue;
 		}
@@ -2228,7 +2230,7 @@ void RenderExecutor::BindImage(ImageId id, bool storage) {
 	}
 	image.binding.is_bound = true;
 	image.binding.shader_write |= storage;
-	m_bound_images.push_back(id);
+	m_bound_images.push_back({id, image.serial});
 }
 
 void RenderExecutor::BindRenderTarget(ImageId id) {
@@ -2238,7 +2240,7 @@ void RenderExecutor::BindRenderTarget(ImageId id) {
 	const auto frame                 = m_context.FlipNumber();
 	image.target_frames[frame & 3u] = frame + 1u;
 #endif
-	m_bound_images.push_back(id);
+	m_bound_images.push_back({id, image.serial});
 }
 
 void RenderExecutor::ResetBindings() {
@@ -2259,12 +2261,13 @@ void RenderExecutor::ResetBindings() {
 		LogTableSummary(TrimTableBindings());
 	}
 	auto& texture_cache = m_context.GetTextureCache();
-	for (const auto id: m_bound_images) {
-		auto& image = texture_cache.m_slot_images[id];
-		if (image.is_stencil_copy && image.binding.shader_write) {
-			texture_cache.FinishStencilStorageWrite(id);
+	for (const auto ref: m_bound_images) {
+		auto* image = ref.Get(texture_cache.m_slot_images);
+		if (image == nullptr) continue;
+		if (image->is_stencil_copy && image->binding.shader_write) {
+			texture_cache.FinishStencilStorageWrite(ref.id);
 		}
-		image.binding = {};
+		image->binding = {};
 	}
 	m_bound_images.clear();
 	if (m_clear_texture_descs) {
@@ -2537,9 +2540,10 @@ void RenderExecutor::PrepareBindingsFromTemplate(const ShaderStageRuntime& runti
 	for (size_t i = 0; i < stage.images.size(); i++) {
 		const auto& source  = stage.images[i];
 		auto&       binding = prepared.images[i];
-		binding.image_id    = source.image_id;
-		binding.image_view  = source.image_view;
-		binding.layout      = source.layout;
+		binding.image_id     = source.image_id;
+		binding.image_serial = source.image_serial;
+		binding.image_view   = source.image_view;
+		binding.layout       = source.layout;
 		if (!binding.mip_views.empty()) {
 			binding.mip_views.clear();
 		}
@@ -2673,6 +2677,7 @@ void RenderExecutor::StoreDrawTemplate(uint64_t key, std::span<PreparedBindings*
 			const auto& binding = prepared->images[i];
 			auto&       copy    = stage.images[i];
 			copy.image_id       = binding.image_id;
+			copy.image_serial   = binding.image_serial;
 			copy.image_view     = binding.image_view;
 			const bool held = prepared->template_stage != nullptr && i < 64u &&
 			                  ((prepared->template_images >> i) & 1u) != 0;
@@ -2689,7 +2694,7 @@ void RenderExecutor::StoreDrawTemplate(uint64_t key, std::span<PreparedBindings*
 			if (!binding.image_id) {
 				continue;
 			}
-			const auto* image = texture_cache.m_slot_images.try_get(binding.image_id);
+			const auto* image = binding.TableImage().Get(texture_cache.m_slot_images);
 			if (image == nullptr || !image->registered || image->version == nullptr ||
 			    image->binding.needs_rebind || image->binding.is_target ||
 			    image->binding.force_general || image->binding.shader_write ||
@@ -3045,9 +3050,11 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 	}
 	for (uint32_t i = 0; i < program.info.images.size(); i++) {
 		if (!images[i].image_id) continue;
-		auto& old_image = texture_cache.m_slot_images[images[i].image_id];
-		if (!old_image.registered || old_image.binding.needs_rebind) {
-			old_image.binding = {};
+		auto* old_image = images[i].TableImage().Get(texture_cache.m_slot_images);
+		if (old_image == nullptr || !old_image->registered || old_image->binding.needs_rebind) {
+			if (old_image != nullptr) {
+				old_image->binding = {};
+			}
 			images[i] = ResolveTexture(program.info.images[i], snapshot.images[i]);
 			BindImage(images[i].image_id,
 			          images[i].desc.type == TextureCache::BindingType::Storage);
@@ -3074,7 +3081,7 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 		auto&      image   = texture_cache.GetImage(binding.image_id);
 		if (binding.lookup != nullptr && !binding.reused) {
 			auto& found           = binding.lookup->found;
-			found.id              = binding.image_id;
+			found.image           = binding.TableImage();
 			found.desc            = binding.desc;
 			found.view            = binding.image_view;
 			found.image_set_epoch = texture_cache.ImageSetEpoch();
