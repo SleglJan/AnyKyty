@@ -2030,10 +2030,12 @@ ImageId TextureCache::AssociateStencil(ImageId depth_id, GuestRange stencil) {
 	}
 
 	ImageId association = FindStencilPlane(depth, stencil);
+	bool    taken_over  = false;
 	if (!association) {
 		ForEachImageWithAddress(stencil.address, [&](ImageId id, Image& owner) {
 			if (owner.info.data == stencil && owner.info.extent == depth.info.extent) {
 				association = id;
+				taken_over  = true;
 			}
 		});
 	}
@@ -2046,6 +2048,7 @@ ImageId TextureCache::AssociateStencil(ImageId depth_id, GuestRange stencil) {
 	auto& record = m_slot_images[association];
 	TouchImage(record);
 	if (record.depth_id != depth_id || record.stencil_subresources != depth.stencil_subresources) {
+		const bool adopted = taken_over && !record.depth_id;
 		ReleaseStencilCopies(association);
 		ImageInfo plane {};
 		plane.data         = stencil;
@@ -2060,6 +2063,7 @@ ImageId TextureCache::AssociateStencil(ImageId depth_id, GuestRange stencil) {
 		    plane.IsTiled() ? TileGetRenderTargetPitch(plane.extent.width, 1) : depth.info.pitch;
 		plane.bytes_per_block = 1;
 		plane.UpdateSize();
+		const bool carried = adopted && CarryStencilContent(record, plane, depth);
 		if (record.depth_id != depth_id) {
 			if (record.depth_id) {
 				std::erase(m_slot_images[record.depth_id].stencil_ids, association);
@@ -2071,9 +2075,29 @@ ImageId TextureCache::AssociateStencil(ImageId depth_id, GuestRange stencil) {
 		record.depth_id             = depth_id;
 		record.stencil_subresources = depth.stencil_subresources;
 		record.StateChanged();
+		if (adopted && !carried) {
+			record.MarkCpuDirty();
+			RefreshImage(association);
+			record.ClearGpuModified();
+		}
 	}
 
 	return association;
+}
+
+bool TextureCache::CarryStencilContent(Image& source, const ImageInfo& plane, Image& depth) {
+	const auto& range = depth.stencil_subresources;
+	if (!source.IsGpuModified() || source.IsCpuDirty() || source.IsBufferModified() ||
+	    source.backing.image == nullptr || source.backing.samples != 1 ||
+	    source.info.tile_mode != plane.tile_mode || source.info.pitch != plane.pitch ||
+	    source.info.bytes_per_block != 1 || vk::blockSize(source.info.pixel_format) != 1 ||
+	    source.info.resources.levels < range.level_count ||
+	    source.info.resources.layers < range.layer_count || depth.backing.image == nullptr ||
+	    depth.info.metadata.stencil_compressed || depth.info.samples != 1) {
+		return false;
+	}
+	CopyColorToStencil(source, depth, range);
+	return true;
 }
 
 ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
@@ -2430,18 +2454,26 @@ bool TextureCache::WriteBackStencilCopy(ImageId copy_id) {
 		copy.depth_copy_writes   = depth.write_count;
 		return true;
 	}
-	const auto  levels      = std::min(copy.backing.mip_levels, range.level_count);
-	const auto  layers      = std::min(copy.backing.layers, range.layer_count);
-	EXIT_IF(levels == 0 || layers == 0 || depth.backing.samples != 1 || copy.backing.samples != 1);
+	CopyColorToStencil(copy, depth, range);
+	copy.stencil_copy_writes = copy.write_count;
+	copy.depth_copy_writes   = depth.write_count;
+	return true;
+}
+
+void TextureCache::CopyColorToStencil(Image& color, Image& depth,
+                                      const ImageSubresourceRange& range) {
+	const auto levels = std::min(color.backing.mip_levels, range.level_count);
+	const auto layers = std::min(color.backing.layers, range.layer_count);
+	EXIT_IF(levels == 0 || layers == 0 || depth.backing.samples != 1 || color.backing.samples != 1);
 	std::vector<vk::BufferImageCopy> stencil_copies;
 	std::vector<vk::BufferImageCopy> color_copies;
 	uint64_t                         size = 0;
 	for (uint32_t level = 0; level < levels; level++) {
 		const vk::Extent3D extent {
 		    std::min(std::max(depth.backing.extent.width >> level, 1u),
-		             std::max(copy.backing.extent.width >> level, 1u)),
+		             std::max(color.backing.extent.width >> level, 1u)),
 		    std::min(std::max(depth.backing.extent.height >> level, 1u),
-		             std::max(copy.backing.extent.height >> level, 1u)),
+		             std::max(color.backing.extent.height >> level, 1u)),
 		    1u};
 		vk::BufferImageCopy region {};
 		region.bufferOffset     = size;
@@ -2460,11 +2492,8 @@ bool TextureCache::WriteBackStencilCopy(ImageId copy_id) {
 	for (auto& region: color_copies) {
 		region.bufferOffset += scratch.offset;
 	}
-	copy.Download(color_copies, scratch.buffer, scratch.offset, size);
+	color.Download(color_copies, scratch.buffer, scratch.offset, size);
 	depth.Upload(stencil_copies, scratch.buffer, scratch.offset, size);
-	copy.stencil_copy_writes = copy.write_count;
-	copy.depth_copy_writes   = depth.write_count;
-	return true;
 }
 
 void TextureCache::FinishStencilStorageWrite(ImageId copy_id) {

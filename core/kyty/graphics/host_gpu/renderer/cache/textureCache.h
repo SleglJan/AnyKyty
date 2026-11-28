@@ -440,6 +440,9 @@ private:
 	[[nodiscard]] ImageId FindLiveStencilStorageCopy(ImageId association, const ImageDesc& desc);
 	void                  RefreshStencilCopy(ImageId copy_id);
 	[[nodiscard]] bool    WriteBackStencilCopy(ImageId copy_id);
+	void                  CopyColorToStencil(Image& color, Image& depth,
+	                                         const ImageSubresourceRange& range);
+	[[nodiscard]] bool    CarryStencilContent(Image& source, const ImageInfo& plane, Image& depth);
 	void                  WriteBackStencilCopies(ImageId depth_id);
 	void                  FinishStencilStorageWrite(ImageId copy_id);
 	void                  ReleaseStencilCopies(ImageId association);

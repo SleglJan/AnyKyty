@@ -76,6 +76,7 @@ constexpr uint64_t MultisampleGuestBytes = 0x100000;
 constexpr uint64_t MultisampleAlignment = 0x10000;
 
 constexpr uint64_t DepthGuestBytes = 0x100000;
+constexpr uint64_t StencilGuestBytes = 0x18000;
 
 const char* CheckFilledMetaClearReachesBind(GraphicContext& graphics, uint64_t base) {
 	RenderContext renderer(graphics);
@@ -978,6 +979,101 @@ const char* CheckLargerRequestOverInvalidatedWrites(GraphicContext& graphics, ui
 
 }
 
+const char* CheckAdoptedStencilKeepsContent(GraphicContext& graphics, uint64_t address, bool gpu_written,
+                                            Prospero::TileMode mode) {
+	RenderContext renderer(graphics);
+	CommandProcessor producer(renderer, 0);
+	producer.Reset();
+	auto& scheduler = renderer.GetCommandScheduler();
+	auto& textures = renderer.GetTextureCache();
+	scheduler.Begin(producer.GetCtx(), producer.GetUcfg(), producer.GetShCtx());
+
+	constexpr uint32_t Width = 64;
+	constexpr uint32_t Height = 32;
+	constexpr uint64_t StencilBytes = uint64_t {Width} * Height;
+	constexpr uint64_t DepthOffset = 0x1000;
+	std::array<uint8_t, StencilBytes> guest_bytes {};
+	std::array<uint8_t, StencilBytes> gpu_bytes {};
+	for (uint32_t i = 0; i < StencilBytes; ++i) {
+		guest_bytes[i] = static_cast<uint8_t>(i * 7u % 251u + 1u);
+		gpu_bytes[i] = static_cast<uint8_t>(i * 13u % 241u + 3u);
+	}
+	if (!Libs::LibKernel::Memory::TryWriteBacking(address, guest_bytes.data(), StencilBytes)) {
+		return "could not write the stencil backing";
+	}
+	ImageInfo info;
+	info.data.address = address;
+	info.pixel_format = vk::Format::eR8Uint;
+	info.guest_format = Prospero::BufferFormat::k8UInt;
+	info.extent = vk::Extent3D {Width, Height, 1};
+	info.pitch = Width;
+	info.bytes_per_block = 1;
+	info.tile_mode = mode;
+	info.UpdateSize();
+	const auto id = TextureCacheTestAccess::Create(textures, info);
+	TextureCache::ImageDesc texture {.info = info};
+	texture.view_info.format = info.pixel_format;
+	if (!textures.FindTexture(id, texture)) return "could not bind the 8-bit image as a texture";
+	Buffer written(graphics, scheduler, MemoryUsage::Upload, 0, vk::BufferUsageFlagBits::eTransferSrc,
+	               StencilBytes);
+	if (gpu_written) {
+		std::memcpy(written.Mapped().data(), gpu_bytes.data(), StencilBytes);
+		written.Flush(0, StencilBytes);
+		const std::array copies {vk::BufferImageCopy {
+		    0, 0, 0, {vk::ImageAspectFlagBits::eColor, 0, 0, 1}, {}, info.extent}};
+		textures.GetImage(id).Upload(copies, written.Handle(), 0, StencilBytes);
+		textures.MarkGpuWritten(id);
+	}
+
+	ImageInfo depth_info;
+	depth_info.data.address = address + DepthOffset;
+	depth_info.pixel_format = vk::Format::eD32SfloatS8Uint;
+	depth_info.guest_format = Prospero::BufferFormat::k32Float;
+	depth_info.extent = info.extent;
+	depth_info.pitch = Width;
+	depth_info.bytes_per_block = sizeof(float);
+	depth_info.stencil = GuestRange {address, info.data.size};
+	depth_info.UpdateSize();
+	const auto depth_id = TextureCacheTestAccess::Create(textures, depth_info);
+	TextureCache::ImageDesc desc {.info = depth_info};
+	desc.type = TextureCache::BindingType::DepthTarget;
+	desc.view_info.format = depth_info.pixel_format;
+	desc.view_info.type = vk::ImageViewType::e2D;
+	desc.view_info.aspect = vk::ImageAspectFlagBits::eDepth | vk::ImageAspectFlagBits::eStencil;
+	desc.view_info.base_level = 0;
+	desc.view_info.level_count = 1;
+	desc.view_info.base_layer = 0;
+	desc.view_info.layer_count = 1;
+	desc.view_info.usage = vk::ImageUsageFlagBits::eDepthStencilAttachment;
+	ImageId stencil_id {};
+	(void)textures.FindDepthTarget(depth_id, desc, &stencil_id);
+	const bool carried = gpu_written && mode == Prospero::TileMode::kLinear;
+	const char* failure = nullptr;
+	if (stencil_id != id) {
+		failure = "the depth target did not take the 8-bit image as its stencil plane";
+	} else if (gpu_written && !carried && textures.GetImage(stencil_id).IsGpuModified()) {
+		failure = "the stencil plane kept the GPU-modified flag of an image whose content it did not carry";
+	}
+
+	Buffer readback(graphics, scheduler, MemoryUsage::Download, 0, vk::BufferUsageFlagBits::eTransferDst,
+	                StencilBytes);
+	const std::array stencil_copy {vk::BufferImageCopy {
+	    0, 0, 0, {vk::ImageAspectFlagBits::eStencil, 0, 0, 1}, {}, info.extent}};
+	textures.GetImage(depth_id).Download(stencil_copy, readback.Handle(), 0, StencilBytes);
+	const auto tick = scheduler.CurrentTick();
+	scheduler.Wait(tick);
+	scheduler.WaitPriorityOperations(tick);
+	if (failure != nullptr) return failure;
+	readback.Invalidate(0, StencilBytes);
+	const auto& expected = carried ? gpu_bytes : guest_bytes;
+	if (std::memcmp(readback.Mapped().data(), expected.data(), StencilBytes) != 0) {
+		if (carried) return "the stencil plane lost the GPU-written content of the 8-bit image it took over";
+		return gpu_written ? "the stencil plane did not get the guest content of a GPU-written image with another tile mode"
+		                   : "the stencil plane lost the guest content of the 8-bit image it took over";
+	}
+	return nullptr;
+}
+
 extern "C" int RunKytyImageWriteBackAliasTest() {
 	Common::InitializeThreads();
 	Config::Initialize();
@@ -1055,6 +1151,26 @@ extern "C" int RunKytyImageWriteBackAliasTest() {
 			failure = CheckFilledMetaClearReachesBind(graphics, depth_address);
 			if (sceKernelMunmap(depth_address, DepthGuestBytes) != 0 && failure == nullptr) {
 				failure = "could not unmap the depth backing";
+			}
+		}
+	}
+	if (failure == nullptr) {
+		void* stencil_guest = nullptr;
+		if (sceKernelMapFlexibleMemory(&stencil_guest, StencilGuestBytes, CpuReadWrite, 0) != 0 || stencil_guest == nullptr) {
+			failure = "could not map the stencil backing";
+		} else {
+			const auto stencil_address = reinterpret_cast<uint64_t>(stencil_guest);
+			constexpr uint64_t Case = StencilGuestBytes / 3;
+			failure = CheckAdoptedStencilKeepsContent(graphics, stencil_address, false, Prospero::TileMode::kLinear);
+			if (failure == nullptr) {
+				failure = CheckAdoptedStencilKeepsContent(graphics, stencil_address + Case, true, Prospero::TileMode::kLinear);
+			}
+			if (failure == nullptr) {
+				failure = CheckAdoptedStencilKeepsContent(graphics, stencil_address + 2 * Case, true,
+				                                          Prospero::TileMode::kStandard4KB);
+			}
+			if (sceKernelMunmap(stencil_address, StencilGuestBytes) != 0 && failure == nullptr) {
+				failure = "could not unmap the stencil backing";
 			}
 		}
 	}
